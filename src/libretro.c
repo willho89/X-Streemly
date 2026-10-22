@@ -5,8 +5,10 @@
  *
  * libretro entry points (CLAUDE.md §3). The only file allowed globals.
  *
- * Content -> source -> tuner; each retro_run asks the presenter for the
- * tick's audio and picture and hands them on (CLAUDE.md §5.5, D-008).
+ * Content -> lineup -> TV -> tuner; each retro_run lets the TV handle input,
+ * asks the presenter for the tick's audio and picture, draws the TV's
+ * overlay on top when there is one, and hands them on (CLAUDE.md §5.5,
+ * §5.10, D-008).
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -21,10 +23,13 @@
 #include <libavutil/time.h>
 #include <rthreads/rthreads.h>
 
+#include "xs_chan.h"
 #include "xs_ctx.h"
+#include "xs_input.h"
+#include "xs_osd.h"
 #include "xs_present.h"
-#include "xs_source.h"
 #include "xs_tuner.h"
+#include "xs_tv.h"
 
 /* Declared at load: the tuning card's size, room for 1080p. A bigger stream
  * raises the maximum with SET_SYSTEM_AV_INFO (§5.4). */
@@ -47,9 +52,28 @@ static xs_ctx_t  *g_ctx;
 static bool       g_can_dupe;
 static double     g_fps = XS_DEFAULT_FPS;
 static double     g_audio_accum;
-static xs_source_t g_source;
-static bool       g_have_source;
 static xs_present_t *g_present;
+static xs_tv_t      *g_tv;
+
+/* The TV's overlay is drawn straight onto the picture on screen (a frame
+ * slot or the presenter's card: memory only this thread touches while it
+ * is shown), without copying whole frames (§5.10). The areas under the
+ * banner text are saved so it can be undone on the same picture. The
+ * opaque panels are only saved on cards: a stream frame is replaced within
+ * a frame period, so a closed panel lingers at most that long (D-024). */
+static uint32_t      *g_save;
+static size_t         g_save_cap;
+static xs_osd_rect_t  g_rects[XS_OSD_MAX_RECTS];
+static bool           g_kept[XS_OSD_MAX_RECTS];   /* saved in g_save */
+static unsigned       g_nrects;
+static uint32_t      *g_saved_pix;     /* picture the overlay is on */
+static unsigned       g_ov_drawn;
+static unsigned       g_pic_h;
+/* The opaque panels (list, info), drawn once per overlay version at the
+ * picture's coordinates and pasted onto each new frame. */
+static uint32_t      *g_panels;
+static size_t         g_panels_cap;
+static unsigned       g_panels_version, g_panels_w, g_panels_h;
 
 /* What the frontend currently believes. */
 static struct retro_system_av_info g_av;
@@ -318,7 +342,7 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
    memset(info, 0, sizeof(*info));
    info->library_name     = "X-Streemly";
    info->library_version  = XS_VERSION;
-   info->valid_extensions = "strm";
+   info->valid_extensions = "m3u|m3u8|strm";
    info->need_fullpath    = true;
    info->block_extract    = true;
 }
@@ -340,8 +364,8 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) 
 
 RETRO_API void retro_reset(void)
 {
-   if (g_ctx && g_ctx->tuner && g_have_source)
-      xs_tuner_tune(g_ctx->tuner, &g_source);   /* re-tune */
+   if (g_tv)
+      xs_tv_start(g_tv);   /* re-tune the channel on */
 }
 
 /* Display-rate output (D-008): frames are presented by PTS, so the core
@@ -358,6 +382,9 @@ static void query_display_rate(void)
 RETRO_API bool retro_load_game(const struct retro_game_info *game)
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+   const char *save_dir = NULL;
+   bool bitmasks = false;
+   xs_chan_t chan;
    char err[512];
 
    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
@@ -376,21 +403,32 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    g_osd_serial  = 0;
    g_played_serial = 0;
    g_osd_state   = XS_TUNER_IDLE;
-   g_have_source = false;
+   g_nrects      = 0;
+   g_saved_pix   = NULL;
+   g_pic_h       = 0;
 
-   if (game && game->path &&
-       !xs_source_from_content(g_ctx, game->path, &g_source, err, sizeof(err)))
+   memset(&chan, 0, sizeof(chan));
+   if (game && game->path)
    {
-      XS_ERROR(g_ctx, "%s\n", err);
-      return false;
+      if (!environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir))
+         save_dir = NULL;
+      if (!xs_chan_load(g_ctx, &chan, game->path, save_dir, err, sizeof(err)))
+      {
+         XS_ERROR(g_ctx, "%s\n", err);
+         return false;
+      }
    }
 
    g_ctx->tuner = xs_tuner_new(g_ctx);
    if (!g_ctx->tuner)
+   {
+      xs_chan_free(&chan);
       return false;
+   }
    g_present = xs_present_new(g_ctx, g_ctx->tuner);
    if (!g_present)
    {
+      xs_chan_free(&chan);
       xs_tuner_free(g_ctx->tuner);
       g_ctx->tuner = NULL;
       return false;
@@ -399,12 +437,32 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
 
    if (!game || !game->path)
    {
-      show_message(6000, false, "No content: load a .strm file to tune a stream");
+      show_message(6000, false, "No content: load a playlist or a .strm file");
       return true;
    }
-   xs_present_set_name(g_present, g_source.name);
-   g_have_source = true;
-   xs_tuner_tune(g_ctx->tuner, &g_source);
+   /* Room for the overlay at the declared maximum, touched now so opening
+    * the channel list never page-faults 8 MB in one tick. */
+   g_panels_cap = (size_t)XS_MAX_WIDTH * XS_MAX_HEIGHT * sizeof(uint32_t);
+   g_save_cap   = g_panels_cap / 4;
+   g_panels     = malloc(g_panels_cap);
+   g_save       = malloc(g_save_cap);
+   if (g_panels)
+      memset(g_panels, 0, g_panels_cap);
+   else
+      g_panels_cap = 0;
+   if (g_save)
+      memset(g_save, 0, g_save_cap);
+   else
+      g_save_cap = 0;
+   environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, &bitmasks);
+   xs_input_set_descriptors(environ_cb);
+   g_tv = xs_tv_new(g_ctx, g_ctx->tuner, g_present, &chan, bitmasks);
+   if (!g_tv)
+   {
+      xs_chan_free(&chan);
+      return false;
+   }
+   xs_tv_start(g_tv);
    return true;
 }
 
@@ -415,6 +473,8 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 
 RETRO_API void retro_unload_game(void)
 {
+   xs_tv_free(g_tv);
+   g_tv = NULL;
    if (g_present)
    {
       xs_present_log_stats(g_present);
@@ -426,7 +486,15 @@ RETRO_API void retro_unload_game(void)
       xs_tuner_free(g_ctx->tuner);
       g_ctx->tuner = NULL;
    }
-   g_have_source = false;
+   free(g_save);
+   g_save        = NULL;
+   g_save_cap    = 0;
+   free(g_panels);
+   g_panels      = NULL;
+   g_panels_cap  = 0;
+   g_panels_w    = 0;
+   g_nrects      = 0;
+   g_saved_pix   = NULL;
 }
 
 /* Tell the viewer what the tuner is doing when that changes. */
@@ -486,6 +554,111 @@ static void update_geometry(const xs_picture_t *pic)
    }
 }
 
+static void copy_rects(uint32_t *pix, size_t pitch, bool save)
+{
+   unsigned i, y;
+   uint32_t *b = g_save;
+   for (i = 0; i < g_nrects; i++)
+      if (g_kept[i])
+         for (y = 0; y < g_rects[i].h; y++, b += g_rects[i].w)
+         {
+            uint32_t *row = (uint32_t *)((uint8_t *)pix + (size_t)(g_rects[i].y + (int)y) * pitch) + g_rects[i].x;
+            if (save)
+               memcpy(b, row, g_rects[i].w * sizeof(uint32_t));
+            else
+               memcpy(row, b, g_rects[i].w * sizeof(uint32_t));
+         }
+}
+
+/* Paste the opaque panels, rendering them first if the overlay or the
+ * picture size changed. */
+static void paste_panels(uint32_t *pix, const xs_picture_t *pic, const xs_overlay_t *ov)
+{
+   size_t need = (size_t)pic->width * pic->height * sizeof(uint32_t);
+   unsigned i, y;
+   bool any = false;
+
+   for (i = 0; i < g_nrects; i++)
+      any |= g_rects[i].panel;
+   if (!any)
+      return;
+   if (!g_panels || g_panels_version != ov->version || g_panels_w != pic->width ||
+       g_panels_h != pic->height)
+   {
+      if (need > g_panels_cap)
+      {
+         uint32_t *nb = realloc(g_panels, need);
+         if (!nb)
+            return;
+         g_panels = nb;
+         g_panels_cap = need;
+      }
+      xs_osd_overlay(g_panels, pic->width, pic->height, pic->width * sizeof(uint32_t), ov, XS_OSD_PANELS);
+      g_panels_version = ov->version;
+      g_panels_w = pic->width;
+      g_panels_h = pic->height;
+   }
+   for (i = 0; i < g_nrects; i++)
+      if (g_rects[i].panel)
+         for (y = 0; y < g_rects[i].h; y++)
+            memcpy((uint32_t *)((uint8_t *)pix + (size_t)(g_rects[i].y + (int)y) * pic->pitch) + g_rects[i].x,
+                   g_panels + (size_t)(g_rects[i].y + (int)y) * pic->width + g_rects[i].x,
+                   g_rects[i].w * sizeof(uint32_t));
+}
+
+/* Keep the TV's overlay on the picture (§5.10). A fresh picture is clean;
+ * on the same picture, a changed or vanished overlay is undone first from
+ * the saved areas. Changes clear pic->dupe so the frontend gets them. */
+static void compose_overlay(xs_picture_t *pic)
+{
+   const xs_overlay_t *ov = g_tv ? xs_tv_overlay(g_tv) : NULL;
+   bool visible = ov && g_ctx->opt.osd && xs_osd_overlay_visible(ov);
+   uint32_t *pix = (uint32_t *)pic->data;   /* ours while on screen */
+   bool fresh = !pic->dupe || pix != g_saved_pix, changed = false;
+
+   if (fresh)
+      g_nrects = 0;   /* a new picture: nothing of ours on it */
+   else if (g_nrects && (!visible || ov->version != g_ov_drawn))
+   {
+      copy_rects(pix, pic->pitch, false);
+      g_nrects = 0;
+      changed  = true;
+   }
+
+   if (visible && !g_nrects)
+   {
+      bool card = xs_present_card_showing(g_present);
+      size_t need = 0;
+      unsigned i;
+      g_nrects = xs_osd_overlay_rects(ov, pic->width, pic->height, g_rects);
+      for (i = 0; i < g_nrects; i++)
+      {
+         g_kept[i] = !g_rects[i].panel || card;
+         if (g_kept[i])
+            need += (size_t)g_rects[i].w * g_rects[i].h * sizeof(uint32_t);
+      }
+      if (need > g_save_cap)
+      {
+         uint32_t *nb = realloc(g_save, need);
+         if (!nb)
+         {
+            g_nrects = 0;
+            return;   /* no overlay this time */
+         }
+         g_save = nb;
+         g_save_cap = need;
+      }
+      copy_rects(pix, pic->pitch, true);
+      paste_panels(pix, pic, ov);
+      xs_osd_overlay(pix, pic->width, pic->height, pic->pitch, ov, XS_OSD_TEXT);
+      g_ov_drawn    = ov->version;
+      g_saved_pix   = pix;
+      changed = true;
+   }
+   if (changed)
+      pic->dupe = false;
+}
+
 RETRO_API void retro_run(void)
 {
    xs_picture_t pic;
@@ -500,6 +673,8 @@ RETRO_API void retro_run(void)
    input_poll_cb();
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       read_options(g_ctx);
+   if (g_tv)
+      xs_tv_tick(g_tv, input_state_cb, g_fps, g_pic_h);
    update_osd();
 
    g_audio_accum += XS_SAMPLE_RATE / g_fps;
@@ -509,6 +684,8 @@ RETRO_API void retro_run(void)
    g_audio_accum -= n;
 
    xs_present_tick(g_present, g_fps, g_audio, n, &pic);
+   compose_overlay(&pic);
+   g_pic_h = pic.height;
    update_geometry(&pic);
    resized = before.base_width != g_av.geometry.base_width ||
              before.base_height != g_av.geometry.base_height;

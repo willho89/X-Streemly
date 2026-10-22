@@ -4,8 +4,8 @@ A [libretro](https://www.libretro.com/) core for **network video**: tune in to l
 channels on a TV. Developed and tested in RetroArch; support for [VRT](https://github.com/willho89/VRT) (an
 emulated CRT TV for Meta Quest) comes later.
 
-> **Status: early development (M1 done).** Plays one stream: point a `.strm` file at an HLS or MPEG-TS URL and load
-> it in RetroArch. Channel lists, channel changing and iptv-org come next. No release yet.
+> **Status: early development (M2 done).** Load an M3U channel list (or a `.strm` file with one URL) in RetroArch
+> and flip through the channels like a TV. Built-in iptv-org channel lists come next. No release yet.
 
 ## What works
 - **Live streams over HTTP(S):** HLS (MPEG-TS segments) and plain MPEG-TS, plus files over HTTP.
@@ -17,21 +17,36 @@ emulated CRT TV for Meta Quest) comes later.
   correction keeps the buffer steady whatever the broadcaster's clock does.
 - **Rides out a bad connection:** holds the picture through a stall, re-buffers, reconnects without losing what's
   buffered, and learns a bigger buffer for streams that need one.
-- **On-screen cards** (tuning, no signal, end of stream), drawn into the picture.
+- **Channel lists:** M3U/M3U8 playlists (including iptv-org's), numbered in order or by `tvg-chno`; encrypted (DRM)
+  channels are recognised and skipped.
+- **TV-style control:** channel up/down (the tune waits until you stop flicking), last channel, previous/next group,
+  number entry on the keyboard, a channel list, an info band; the last channel is remembered.
+- **On-screen display drawn into the picture:** channel number and name, tuning / no signal / end of stream cards.
 
 ## Trying it
-Write the stream's URL into a text file ending in `.strm`, then load that file with the core in RetroArch:
+Load an `.m3u` channel list with the core in RetroArch, for example one of iptv-org's
+(`https://iptv-org.github.io/iptv/countries/uk.m3u`, saved to a file). For a single stream, write its URL into a
+text file ending in `.strm`:
 
 ```
 https://example.com/live/channel/playlist.m3u8
 ```
 
+| RetroPad | |
+|---|---|
+| Up / Down | Channel up / down |
+| B | Last channel |
+| L / R | Previous / next group |
+| A | Info |
+| Select | Channel list (Up/Down, A to tune, B to close) |
+| Keyboard 0–9 | Channel number |
+
 ## Planned
 - **Free IPTV out of the box:** channel lists from [iptv-org](https://github.com/iptv-org/iptv), a community
   collection of publicly available TV streams, browsable by country, category and language. X-Streemly hosts no
   streams.
-- **Your own playlists:** M3U/M3U8 channel lists.
-- **TV-style control:** channel up/down, last channel, number entry, an info banner with the channel name.
+- **Playlists from the web:** a `.strm` pointing at an online M3U list.
+- **Favourites.**
 - **VRT:** standard-definition output and interlaced streams sent field by field to VRT's virtual CRT.
 - **Later:** a companion app for Linux and Windows that casts a low-resolution virtual monitor (an app, a video
   player…) to X-Streemly over the network.

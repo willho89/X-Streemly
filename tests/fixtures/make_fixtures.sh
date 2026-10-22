@@ -19,6 +19,7 @@
 #   p2997.ts    1080p29.97 H.264 + AC-3, 10 s
 #   p50.ts      720p50 H.264 + AAC, 10 s
 #   hevc.ts     720p25 HEVC + E-AC-3, 6 s
+#   parser_*.m3u  channel lists that exercise the M3U parser
 #   tls/        self-signed certificate for localhost (server.py --tls)
 set -eu
 
@@ -87,6 +88,17 @@ echo "== hevc.ts (720p25 HEVC + E-AC-3)"
 $FF -f lavfi -i "$(video 1280x720 25 6)" -f lavfi -i "$(audio 6)" \
    -c:v libx265 -preset ultrafast -x265-params log-level=error -pix_fmt yuv420p -g 25 \
    -c:a eac3 -b:a 192k -f mpegts "$OUT/hevc.ts"
+
+echo "== playlists for the parser (BOM + CRLF + quoted commas; Latin-1; relative entries)"
+printf '\357\273\277#EXTM3U x-tvg-url="http://example.com/epg.xml"\r\n' > "$OUT/parser_utf8.m3u"
+printf '#EXTINF:-1 tvg-id="One.uk" tvg-logo="http://x/1.png" group-title="News, UK",One News (1080p) [Geo-blocked]\r\n' >> "$OUT/parser_utf8.m3u"
+printf 'http://example.com/one.m3u8\r\n' >> "$OUT/parser_utf8.m3u"
+printf '#EXTGRP:Music\r\n#EXTINF:-1 tvg-chno="7",Two, the channel (720p) [Not 24/7]\r\n' >> "$OUT/parser_utf8.m3u"
+printf '#EXTVLCOPT:http-referrer=https://two.example/\r\n#EXTVLCOPT:http-user-agent=TwoAgent/1.0\r\n' >> "$OUT/parser_utf8.m3u"
+printf 'https://example.com/two/index.m3u8\r\n' >> "$OUT/parser_utf8.m3u"
+printf '#KODIPROP:inputstream.adaptive.license_type=com.widevine.alpha\r\n#EXTINF:-1 tvg-name="Three Name",\r\n' >> "$OUT/parser_utf8.m3u"
+printf 'three/playlist.m3u8\r\n#EXTINF:-1,Caf\303\251 TV\r\n/abs/cafe.ts\r\n' >> "$OUT/parser_utf8.m3u"
+printf '#EXTM3U\n#EXTINF:-1 group-title="T\351l\351",T\351l\351 Une\nhttp://example.com/tele.ts\n' > "$OUT/parser_latin1.m3u"
 
 echo "== tls (self-signed, localhost)"
 mkdir -p "$OUT/tls"

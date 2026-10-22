@@ -57,10 +57,13 @@ struct xs_present
    char        name[256];
 
    unsigned  gen, serial;
+   unsigned  gen_seen;        /* the tune timed by tune_us */
    pstate_t  state;
    bool      has_audio, has_video;
    bool      have_frame;      /* a stream frame is on screen */
    bool      started;         /* this serial played at least once */
+   bool      pictured;        /* first picture of this tune shown */
+   int64_t   tune_us;         /* when this tune or attempt began */
    int64_t   clock_us;
    unsigned  fade_in;
    uint64_t  ticks;
@@ -156,6 +159,12 @@ static void reset(xs_present_t *p, const xs_tuner_status_t *st)
    p->has_video  = st->has_video;
    p->have_frame = false;
    p->started    = false;
+   if (st->gen != p->gen_seen)
+   {
+      p->gen_seen = st->gen;
+      p->pictured = false;
+      p->tune_us  = av_gettime_relative();
+   }
    p->ratio      = 1.0;
    p->floor_us   = 0;
    clear_window(p);
@@ -274,6 +283,11 @@ static bool controller(xs_present_t *p, double fps, int64_t level_us)
    return false;
 }
 
+bool xs_present_card_showing(const xs_present_t *p)
+{
+   return p->card_on_screen;
+}
+
 void xs_present_log_stats(xs_present_t *p)
 {
    xs_video_stats_t vs;
@@ -305,7 +319,14 @@ static void stream_picture(xs_present_t *p, int64_t until_us, xs_picture_t *pic,
    bool changed = xs_video_advance(xs_tuner_video(p->tuner), p->serial, until_us, &f, &dropped);
    p->dropped += dropped;
    if (changed)
+   {
       p->shown++;
+      if (!p->pictured)
+      {
+         p->pictured = true;
+         XS_INFO(p->ctx, "picture %.2f s after tune\n", (av_gettime_relative() - p->tune_us) / 1e6);
+      }
+   }
    *have = changed || (p->have_frame && xs_video_current(xs_tuner_video(p->tuner), &f));
    if (!*have)
       return;

@@ -39,6 +39,9 @@ void xs_present_set_name(xs_present_t *p, const char *name);
 void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frames,
                      xs_picture_t *pic);
 
+/* The last tick showed a card (tuning, no signal ...), not the stream. */
+bool xs_present_card_showing(const xs_present_t *p);
+
 /* Log a summary line (also done every minute while playing). */
 void xs_present_log_stats(xs_present_t *p);
 

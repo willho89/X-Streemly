@@ -12,5 +12,9 @@ SOURCES_C := \
 	$(CORE_DIR)/xs_video.c \
 	$(CORE_DIR)/xs_present.c \
 	$(CORE_DIR)/xs_osd.c \
+	$(CORE_DIR)/xs_playlist.c \
+	$(CORE_DIR)/xs_chan.c \
+	$(CORE_DIR)/xs_input.c \
+	$(CORE_DIR)/xs_tv.c \
 	$(CORE_DIR)/xs_glibc_compat.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c

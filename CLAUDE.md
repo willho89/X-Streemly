@@ -260,7 +260,13 @@ opens URLs.
 - iptv-org titles carry suffixes like ` (720p)`, ` [Geo-blocked]`, ` [Not 24/7]`: strip them for display, keep them
   as flags.
 - Remote playlists (URL in a `.strm` pointing to an `.m3u`) are fetched by xs_fetch off the emulation thread, never
-  in `retro_load_game`.
+  in `retro_load_game`: **M3** (it needs the fetch thread iptv-org uses; M2 reads local playlists only).
+- Done in M2 (`src/xs_playlist.c`, adapted from VLC m3u.c): quote-aware `#EXTINF` attributes (the first unquoted
+  comma starts the title), `tvg-name` when the title is empty, `tvg-chno`/`channel-number`, `group-title` or a
+  carried-over `#EXTGRP`, Latin-1 lists widened to UTF-8, an HLS playlist given as content = one channel.
+- Numbering (`src/xs_chan.c`): the playlist's `tvg-chno` when every channel has its own, else 1.. in order. Last and
+  previous channel remembered per lineup in `<save_dir>/X-Streemly/<hash of the content path>.state`, written once
+  the channel has settled for 5 s and at unload (not on every zap: file I/O on the emulation thread).
 
 ### 5.8 iptv-org (xs_iptv.c) — D-010, D-011
 - Data used (sizes measured 2026-10-21): per-country playlists `https://iptv-org.github.io/iptv/countries/<cc>.m3u`
@@ -283,13 +289,16 @@ opens URLs.
 ### 5.9 Input (xs_input.c)
 | Button | Action |
 |---|---|
-| D-pad Up / Down | Channel up / down (auto-repeat after 400 ms; tunes after release or 600 ms idle, so flicking through doesn't open every stream) |
+| D-pad Up / Down | Channel up / down, skipping DRM channels (auto-repeat after 400 ms, every 120 ms; the banner follows at once, the tune happens when no zap button is held and input has been idle 500 ms, so flicking through doesn't open every stream) |
 | B | Last channel (recall) |
-| A | Info banner (channel number, name, group, resolution, codec, status) |
-| L / R | Previous / next group (category) |
+| A | Info band (number, name, group/flags, stream summary, state) for 6 s; A again hides it |
+| L / R | Previous / next group (first channel of it) |
 | X | Favourite toggle (M3, favourites group) |
-| Select | In-core channel list overlay (M2) |
-| Keyboard 0–9 | Direct channel number entry, tunes after 1.5 s or Enter |
+| Select | Channel list (Up/Down move, L/R page, A tunes, B/Select close) |
+| Keyboard 0–9 | Direct channel number entry: tunes at once when no longer number exists, else after 1.5 s or Enter; "NO CHANNEL n" otherwise |
+
+Done in M2 (`src/xs_input.c`, `src/xs_tv.c`). Encrypted (DRM) channels picked by number or from the list show
+"ENCRYPTED: CAN'T PLAY" and stay on the current channel.
 
 ### 5.10 OSD (xs_osd.c) — D-009
 - The channel number and name are drawn **into the picture** by the core, like a real TV's on-screen display, and
@@ -298,6 +307,13 @@ opens URLs.
 - Elements: channel banner (big number top-right, a few seconds), info banner, "tuning…" card (black or static +
   optional hiss), "no signal"/error card with a short reason, number-entry digits, channel list overlay.
 - `SET_MESSAGE_EXT` is sent as well when the in-picture OSD is off.
+- **Done in M2 (D-024):** banner (number in 90s-TV green, 4 font pixels per unit, top right inside the overscan;
+  name and group under it; only the number over a card, which already names the channel), notes, info band and
+  channel list (opaque panels in a 90s menu blue), laid out in `xs_osd.c` from one `layout()` that also gives the
+  covered rectangles. Drawn **in place** on the picture on screen: the areas under the banner text are saved and
+  restored when it changes; the panels are rendered once per change into a buffer (allocated and touched at load)
+  and pasted onto each new frame, and only saved on cards. Cost at 1080p: ~0.2 ms per tick with the banner,
+  ~0.5 ms mean / 1.8 ms p99 with the list open (2–3 ms when it was copied whole or the panel darkened the picture).
 
 ### 5.11 Core options (SET_CORE_OPTIONS_V2)
 Lineup source (playlist / iptv-org), iptv-org filters (§5.8), Max resolution, Output rate, Deinterlace,
@@ -463,7 +479,7 @@ guide listing the channels, content folder (`m3u` is also claimed by `pcsx_rearm
 | Plan | ☑ Approved (2026-10-21) | All §13 proposals accepted by the user. |
 | M0 Skeleton | ☑ Done (2026-10-21) | Submodules FFmpeg n8.1.3, mbedTLS v3.6.7, libretro-common master (a3194c1). `Makefile.deps` builds both static (mbedTLS from a copy in `build/mbedtls/src`, its own Makefile). Core: `libretro.c` (options v2, FFmpeg log bridge, display-rate timing via GET_TARGET_REFRESH_RATE, black 640×360 frame then dupes, exact silence per tick, SET_MESSAGE_EXT status), `xs_source.c` (.strm / URL → source, open with headers, timeouts, reconnect, live_start_index, protocol whitelist), `xs_tuner.c` (thread, mailbox, interrupt callback for abort + 15 s open / 20 s data deadlines, stream-info log, packet read loop). `tests/harness.c` (real-time pacing, retro_run mean/p99/max excluding its own callbacks, unload time, OSD lines), `tests/server.py` (HTTP(S), looping live.m3u8 from vod.m3u8, `_delay/_status/_stall/_drop`), `tests/fixtures/make_fixtures.sh` (hls2 720p+1080p, i1080, i576 MPEG-2, p2997 AC-3, p50, HEVC/E-AC-3, TLS cert), `tests/check.sh`. **make check: 10/10 pass** (HTTPS HLS opens in ~0.5 s with both variants; retro_run max ≤ 111 µs; unload while connecting 4–6 ms; 404 → No signal). Core NEEDED = libc, libm only; 25 exports; glibc floor 2.35. **Acceptance in the user's Steam RetroArch** (copied config, `-L`): HTTPS HLS fixture opened in 465 ms, same stream log, OSD summary shown, tuner stopped in 8 ms on quit. **Next: M1.** |
 | M1 One stream | ☑ Done (2026-10-22) | Tuner thread (variant pick, timeline epochs D-023, inline audio decode, retries/reconnect D-018), `xs_pktq` + video thread (frame threads, bwdif/yadif at field rate, swscale threaded into zero-copy slots, early drop), audio ring as the clock (D-020) with floor controller, adaptive jitter buffer and live-edge catch-up (D-019, D-022), presenter with tuning/no-signal/end cards (5×7 OSD font), wall-clock stats line. **make check 18/18** (A/V within 4.7–14 ms on every fixture, ≤ 40 ms at loop joins; field rate; caps; stall, gaps, file end). **Harness 30 min live HLS 1080p:** 1800/1800 flashes matched, mean +1.5 ms, worst +40.3 ms (at loop joins), 0 clicks/underruns/drops, 90 joins, 48 % of one core. **RetroArch 30 min, CNBC UK 1080p (public):** 59.95 ticks/s, 0 underruns, 7 drops at start, 295–299 MB flat, ~130 % CPU (whole frontend), two ad-splice discontinuities joined. **RetroArch 30 min, live 1080i (local fixture, public 1080i unsustainable: see notes):** 60.16 ticks/s, 90,480 pictures (50.3/s), 1 drop, 0 underruns, 91 joins, 279 MB flat, ~160 % CPU. Not done: A/V measured only in the harness; >1080p and AES-128 HLS untested; `retro_run` max can reach ~5 ms while the desktop is busy (make check limit 5 ms may flake). **Next: M2.** |
-| M2 Playlists | ☐ | |
+| M2 Playlists | ☑ Done (2026-10-22) | `xs_playlist` (VLC m3u.c port + IPTV extensions), `xs_chan` (numbering, groups, last/previous remembered), `xs_input` (RetroPad with auto-repeat, keyboard digits), `xs_tv` (zap with settle, last channel, number entry, groups, list, info), overlay in `xs_osd` drawn in place (D-024). **make check 26/26** (parser on BOM/CRLF/quoted commas/EXTGRP/EXTVLCOPT/KODIPROP/Latin-1/relative URLs; zap over a 10-channel lineup with dead, slow, DRM, gappy and unreachable channels: picture 0.18–0.45 s after each tune; 20 quick taps = 1 tune; 20 zaps 0.67 s apart = 21 tunes, retro_run p99 ≈ 1 ms; hold; groups; list; remembered across restarts). **RetroArch** (scripted through its Network RetroPad with `tests/ra_press.py`: see notes): remembered channel restored, Up/Up/Up skipping DRM, B, list, R/L groups, 10 taps = 1 tune, 1.5 s hold = 1 tune; picture 0.06–0.47 s after each tune; 60 ticks/s. Not done: remote playlists (M3), keyboard digits only tested in the harness. **Next: M3.** |
 | M3 iptv-org | ☐ | |
 | M4 Robustness | ☐ | |
 | M5 Distribution | ☐ | |
@@ -486,6 +502,12 @@ guide listing the channels, content folder (`m3u` is also claimed by `pcsx_rearm
 - With both HLS variants un-discarded FFmpeg downloads both (M0 behaviour); variant selection is M1 (§5.3).
 - `codecpar->field_order` is unknown (`scan ?`) for H.264 inside HLS after find_stream_info, but known for the same
   streams as plain TS: M1 must take scan type from decoded frames.
+- **Driving RetroArch unattended** (2026-10-22): its Network RetroPad (`network_remote_enable = "true"`,
+  `network_remote_enable_user_p1 = "true"` in the test config) takes UDP packets on port
+  `network_remote_base_port` (55400) + user: `struct remote_message { int port; int device; int index; int id;
+  uint16_t state; }` (20 bytes, little endian; device 1 = joypad, id = RETRO_DEVICE_ID_JOYPAD_*, state 1/0). A
+  small sender, `python3 -I tests/ra_press.py 55400 "8:UP,4:B,4:UP*1500"`, scripts presses. Keyboard keys can't be sent this way. RetroArch keeps
+  core saves in `saves/X-Streemly/X-Streemly/` (per-core folder): remove test state files from there.
 - **RetroArch test runs** (2026-10-21): `cp retroarch.cfg <scratch>/ra-test.cfg`, set `config_save_on_exit = "false"`,
   `core_options_path`, `video_fullscreen = "false"`, `libretro_log_level = "0"`; launch from the RetroArch dir with
   `SteamLinuxRuntime/steam-runtime/run.sh ./retroarch.sh --config <copy> --verbose --log-file <log> -L
@@ -539,6 +561,8 @@ guide listing the channels, content folder (`m3u` is also claimed by `pcsx_rearm
 | D-020 | The audio ring is the clock (next sample's PTS); D-007's controller steers the 20 s buffer floor, not a smoothed level. | Lip sync is exact by construction (fixtures: within a few ms); the floor is what matters with segment bursts. | Accepted (2026-10-21, M1), refines D-007 |
 | D-022 | Adaptive jitter buffer: floor target = option + 1 s per underrun (≤ +10 s) + half the observed burst. | A fixed 1 s floor underran on every 6 s CNBC segment (FFmpeg finds new segments up to half a target duration late); adaptive: 0 underruns. | Accepted (2026-10-22, M1) |
 | D-023 | Timeline joins per stream through shared epochs; forward jumps ≤ 10 s are kept as gaps, only backward jumps > 1 s and forward > 10 s are joined. | One shared offset ping-ponged when streams crossed a jump at different times (interleaving), shifting A/V by seconds; expired segments are missing content, not a timeline break. Fixture `/_gap/` (content gaps, numbering intact) in make check. | Accepted (2026-10-22, M1) |
+| D-024 | The overlay is drawn in place on the picture on screen; banner areas are saved/restored, opaque panels are pasted from a once-rendered buffer and only saved on cards (on stream frames a closed panel can linger one frame period). | Copying the whole 1080p frame (8 MB) to draw on cost 1–6 ms per new frame; in place: ~0.2 ms (banner), ~0.5 ms mean with the list open. | Accepted (2026-10-22, M2) |
+| D-025 | `make check` timing: retro_run p99 ≤ 5 ms and max ≤ 50 ms (was max ≤ 5 ms). The harness reports each slow tick's thread CPU time. | On a busy desktop single ticks of 3–25 ms are the OS preempting the thread (e.g. 3.0 ms wall, 1.2 ms CPU); real blocking (network, held locks) costs tens of ms to seconds, which the max still catches. | Accepted (2026-10-22, M2) |
 | D-021 | Live = no duration and (for non-hls inputs) no known size. | FFmpeg reports no duration for MPEG-TS over HTTP, so files were taken for live streams and "reconnected" in a loop. | Accepted (2026-10-21, M1) |
 
 ---

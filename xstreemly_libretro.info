@@ -1,12 +1,12 @@
 # Software Information
 display_name = "Network Video (X-Streemly)"
 authors = "willho89"
-supported_extensions = "strm"
+supported_extensions = "m3u|m3u8|strm"
 corename = "X-Streemly"
 categories = "Media Player"
 license = "GPLv2+ (binaries GPLv3: FFmpeg with mbedTLS)"
 permissions = ""
-display_version = "0.0.1"
+display_version = "0.1.0"
 
 # Hardware Information
 manufacturer = "N/A"

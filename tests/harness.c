@@ -15,9 +15,10 @@
  *   HARNESS_DEBUG=1                 show DEBUG-level core logs
  *   HARNESS_FAST=1                  don't pace frames in real time
  *   HARNESS_REFRESH=<hz>            display rate reported to the core (60)
- *   HARNESS_INPUT="300:A,900:UP"    press a RetroPad button on a frame (held
- *                                   for 2 frames); names: A B X Y L R L2 R2
- *                                   L3 R3 START SELECT UP DOWN LEFT RIGHT
+ *   HARNESS_INPUT="300:A,900:UP*60" press a RetroPad button on a frame, held
+ *                                   for 2 frames or *N frames; names: A B X Y
+ *                                   L R L2 R2 L3 R3 START SELECT UP DOWN LEFT
+ *                                   RIGHT, keyboard K0..K9 KENTER
  *   HARNESS_DUMP=<dir>              write PPM snapshots there...
  *   HARNESS_DUMP_FRAMES="60,600"    ...at these frame numbers (default: 60)
  *   HARNESS_DUMP_EVERY=<n>          ...or every n frames
@@ -63,6 +64,15 @@ static double now_s(void)
 {
    struct timespec ts;
    clock_gettime(CLOCK_MONOTONIC, &ts);
+   return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* CPU time of the calling thread: a slow tick with little CPU was waiting
+ * (a lock, or the OS ran something else), not working. */
+static double thread_cpu_s(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
    return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
@@ -194,7 +204,7 @@ static void wav_close(void)
 }
 
 #define MAX_EVENTS 256
-static struct { unsigned frame; unsigned id; } g_input[MAX_EVENTS];
+static struct { unsigned frame; unsigned id; unsigned hold; bool key; } g_input[MAX_EVENTS];
 static unsigned g_ninput;
 
 static const struct { const char *name; unsigned id; } g_buttons[] = {
@@ -217,16 +227,33 @@ static void parse_input(const char *spec)
    for (tok = strtok_r(buf, ",", &save); tok && g_ninput < MAX_EVENTS;
         tok = strtok_r(NULL, ",", &save))
    {
-      char *colon = strchr(tok, ':');
+      char *colon = strchr(tok, ':'), *star;
+      unsigned hold = 2;
       size_t i;
       if (!colon)
          continue;
       *colon = '\0';
+      if ((star = strchr(colon + 1, '*')))
+      {
+         *star = '\0';
+         hold = (unsigned)atoi(star + 1);
+      }
+      if (colon[1] == 'K' && colon[2])
+      {
+         g_input[g_ninput].frame = (unsigned)atoi(tok);
+         g_input[g_ninput].id    = !strcmp(colon + 2, "ENTER") ? RETROK_RETURN : RETROK_0 + (unsigned)atoi(colon + 2);
+         g_input[g_ninput].hold  = hold;
+         g_input[g_ninput].key   = true;
+         g_ninput++;
+         continue;
+      }
       for (i = 0; i < sizeof(g_buttons) / sizeof(g_buttons[0]); i++)
          if (!strcmp(colon + 1, g_buttons[i].name))
          {
             g_input[g_ninput].frame = (unsigned)atoi(tok);
             g_input[g_ninput].id    = g_buttons[i].id;
+            g_input[g_ninput].hold  = hold;
+            g_input[g_ninput].key   = false;
             g_ninput++;
          }
    }
@@ -318,6 +345,8 @@ static bool h_env(unsigned cmd, void *data)
          var->value = getenv(name);
          return var->value != NULL;
       }
+      case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
+         return true;
       case RETRO_ENVIRONMENT_GET_CAN_DUPE:
          *(bool *)data = true;
          return true;
@@ -404,11 +433,12 @@ static void h_poll(void) { }
 static int16_t h_input(unsigned port, unsigned dev, unsigned idx, unsigned id)
 {
    unsigned i;
-   if (port != 0 || dev != RETRO_DEVICE_JOYPAD)
+   bool key = dev == RETRO_DEVICE_KEYBOARD;
+   if (port != 0 || (dev != RETRO_DEVICE_JOYPAD && !key))
       return 0;
    for (i = 0; i < g_ninput; i++)
-      if (g_input[i].id == id && g_frame_no >= g_input[i].frame &&
-          g_frame_no < g_input[i].frame + 2)
+      if (g_input[i].key == key && g_input[i].id == id && g_frame_no >= g_input[i].frame &&
+          g_frame_no < g_input[i].frame + g_input[i].hold)
          return 1;
    return 0;
 }
@@ -432,7 +462,7 @@ int main(int argc, char **argv)
    struct retro_system_av_info av;
    struct retro_game_info game = { 0 };
    bool realtime = !getenv("HARNESS_FAST");
-   double *run_s, t0, t, sum = 0, wall = 0;
+   double *run_s, t0, t, tc, cpu, cpu_max = 0, sum = 0, wall = 0;
    struct rusage ru0, ru1;
 
    void (*p_retro_set_environment)(retro_environment_t);
@@ -518,12 +548,16 @@ int main(int argc, char **argv)
          }
       }
       t = now_s();
+      tc = thread_cpu_s();
       g_cb_s = 0;
       p_retro_run();
       run_s[i] = now_s() - t - g_cb_s;
+      cpu = thread_cpu_s() - tc - g_cb_s;
+      if (cpu > cpu_max)
+         cpu_max = cpu;
       sum += run_s[i];
       if (getenv("HARNESS_SLOW_US") && run_s[i] * 1e6 > atof(getenv("HARNESS_SLOW_US")))
-         printf("slow retro_run at frame %u: %.0f us\n", i, run_s[i] * 1e6);
+         printf("slow retro_run at frame %u: %.0f us (%.0f us on the CPU)\n", i, run_s[i] * 1e6, cpu * 1e6);
       if (want_dump(i))
          dump_frame(i);
    }
@@ -541,8 +575,8 @@ int main(int argc, char **argv)
    if (frames)
    {
       qsort(run_s, frames, sizeof(*run_s), cmp_double);
-      printf("run_us: mean %.0f p99 %.0f max %.0f\n", 1e6 * sum / frames,
-             1e6 * run_s[(size_t)(frames * 0.99)], 1e6 * run_s[frames - 1]);
+      printf("run_us: mean %.0f p99 %.0f max %.0f (cpu max %.0f)\n", 1e6 * sum / frames,
+             1e6 * run_s[(size_t)(frames * 0.99)], 1e6 * run_s[frames - 1], 1e6 * cpu_max);
    }
    free(run_s);
    {

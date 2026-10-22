@@ -1,0 +1,22 @@
+#EXTM3U
+#EXTINF:-1 tvg-id="FixtureNews.uk" group-title="News",Fixture News (1080p)
+@HTTPS@/hls2/master.m3u8
+#EXTINF:-1 group-title="News",Fixture News 720 (720p)
+@HTTPS@/hls2/v720/live.m3u8
+#EXTINF:-1 group-title="Sport",Interlaced Sport (1080i)
+@HTTPS@/hls_i1080/live.m3u8
+#EXTINF:-1 group-title="Sport",Dead Channel [Geo-blocked]
+@HTTPS@/_status/403/dead/index.m3u8
+#EXTINF:-1 group-title="Movies",SD Movies (576i)
+@HTTP@/i576.ts
+#EXTINF:-1 group-title="Movies",Slow Channel [Not 24/7]
+@HTTPS@/_delay/30000/hls2/master.m3u8
+#KODIPROP:inputstream.adaptive.license_type=com.widevine.alpha
+#EXTINF:-1 group-title="Movies",Encrypted Channel
+@HTTPS@/hls2/master.m3u8
+#EXTINF:-1 group-title="Kids",Gappy Kids
+@HTTPS@/_gap/4/hls2/master.m3u8
+#EXTINF:-1 group-title="Kids",HEVC Kids
+@HTTPS@/hevc.ts
+#EXTINF:-1 group-title="Music",Unreachable
+https://127.0.0.1:1/nothing/index.m3u8
