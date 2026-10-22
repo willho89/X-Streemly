@@ -1,0 +1,11 @@
+CORE_DIR          := src
+LIBRETRO_COMM_DIR := libretro-common
+
+INCFLAGS := -I$(CORE_DIR) -I$(LIBRETRO_COMM_DIR)/include
+
+SOURCES_C := \
+	$(CORE_DIR)/libretro.c \
+	$(CORE_DIR)/xs_source.c \
+	$(CORE_DIR)/xs_tuner.c \
+	$(CORE_DIR)/xs_glibc_compat.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c

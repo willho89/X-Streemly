@@ -1,0 +1,12 @@
+[submodule "deps/ffmpeg"]
+	path = deps/ffmpeg
+	url = https://git.ffmpeg.org/ffmpeg.git
+	shallow = true
+[submodule "deps/mbedtls"]
+	path = deps/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git
+	shallow = true
+[submodule "libretro-common"]
+	path = libretro-common
+	url = https://github.com/libretro/libretro-common.git
+	shallow = true

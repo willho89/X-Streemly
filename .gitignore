@@ -2,4 +2,6 @@ build/
 *.so
 *.dll
 *.dylib
-/deps/*/
+*.exe
+tests/fixtures/out/
+build-*.log

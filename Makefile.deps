@@ -1,0 +1,63 @@
+# X-Streemly — static dependency builds (mbedTLS, FFmpeg)
+# Included from Makefile. Deps are built static + PIC and installed into
+# prefixes under $(BUILD_DIR); the submodule checkouts stay pristine.
+
+DEPS_DIR       := deps
+MBEDTLS_BUILD  := $(BUILD_DIR)/mbedtls
+MBEDTLS_PREFIX := $(abspath $(MBEDTLS_BUILD)/prefix)
+FFMPEG_BUILD   := $(BUILD_DIR)/ffmpeg
+FFMPEG_PREFIX  := $(abspath $(FFMPEG_BUILD)/prefix)
+
+# mbedTLS 3.6 builds with its own plain Makefile. Release tags ship the
+# generated sources (the generator scripts are copied only because the
+# Makefile names them as order-only prerequisites); the tree is copied so the
+# objects land in the build dir, not the submodule.
+$(MBEDTLS_BUILD)/.mbedtls.stamp:
+	rm -rf $(MBEDTLS_BUILD)
+	@mkdir -p $(MBEDTLS_BUILD)/src $(MBEDTLS_PREFIX)/lib
+	cp -R $(DEPS_DIR)/mbedtls/include $(DEPS_DIR)/mbedtls/library $(DEPS_DIR)/mbedtls/3rdparty \
+		$(DEPS_DIR)/mbedtls/scripts $(MBEDTLS_BUILD)/src/
+	@mkdir -p $(MBEDTLS_BUILD)/src/framework
+	cp -R $(DEPS_DIR)/mbedtls/framework/scripts $(MBEDTLS_BUILD)/src/framework/
+	$(MAKE) -C $(MBEDTLS_BUILD)/src/library libmbedcrypto.a libmbedx509.a libmbedtls.a CC="$(CC)" AR="$(AR)" \
+		CFLAGS="-O2 -fPIC -fvisibility=hidden" GEN_FILES=
+	cp -R $(MBEDTLS_BUILD)/src/include $(MBEDTLS_PREFIX)/
+	cp $(MBEDTLS_BUILD)/src/library/libmbedtls.a $(MBEDTLS_BUILD)/src/library/libmbedx509.a \
+		$(MBEDTLS_BUILD)/src/library/libmbedcrypto.a $(MBEDTLS_PREFIX)/lib/
+	@touch $@
+
+FFMPEG_TLS ?= --enable-mbedtls
+
+# Only what network video needs (CLAUDE.md §6). --enable-version3 is required
+# by mbedTLS (D-004): binaries are GPLv3. udp: n8.1.3's tls_mbedtls.c calls
+# ff_udp_* (DTLS) without a configure dependency on it.
+FFMPEG_CONFIGURE := --prefix=$(FFMPEG_PREFIX) --enable-static --disable-shared --enable-pic $(FFMPEG_TARGET) \
+	--enable-gpl --enable-version3 \
+	--disable-everything --disable-programs --disable-doc --disable-autodetect --disable-avdevice \
+	--enable-avformat --enable-avcodec --enable-swscale --enable-swresample --enable-avfilter \
+	--enable-network --enable-pthreads $(FFMPEG_TLS) \
+	--enable-protocol=http,https,tls,tcp,crypto,file,udp \
+	--enable-demuxer=hls,mpegts,mov,aac,ac3,eac3,mp3,flv \
+	--enable-decoder=h264,hevc,mpeg2video,mpeg1video,aac,aac_latm,mp2,mp3,ac3,eac3 \
+	--enable-parser=h264,hevc,mpegvideo,aac,aac_latm,mpegaudio,ac3 \
+	--enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc \
+	--enable-filter=bwdif,yadif,buffer,buffersink,abuffer,abuffersink,format,aformat \
+	--extra-cflags=-I$(MBEDTLS_PREFIX)/include --extra-ldflags=-L$(MBEDTLS_PREFIX)/lib
+
+
+$(FFMPEG_BUILD)/.ffmpeg.stamp: $(MBEDTLS_BUILD)/.mbedtls.stamp
+	rm -rf $(FFMPEG_BUILD)
+	@mkdir -p $(FFMPEG_BUILD)/build
+	cd $(FFMPEG_BUILD)/build && $(abspath $(DEPS_DIR)/ffmpeg)/configure $(FFMPEG_CONFIGURE)
+	$(MAKE) -C $(FFMPEG_BUILD)/build
+	$(MAKE) -C $(FFMPEG_BUILD)/build install
+	@touch $@
+
+DEPS_STAMPS := $(MBEDTLS_BUILD)/.mbedtls.stamp $(FFMPEG_BUILD)/.ffmpeg.stamp
+
+deps: $(DEPS_STAMPS)
+
+deps-clean:
+	rm -rf $(MBEDTLS_BUILD) $(FFMPEG_BUILD)
+
+.PHONY: deps deps-clean

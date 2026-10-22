@@ -1,0 +1,24 @@
+# Software Information
+display_name = "Network Video (X-Streemly)"
+authors = "willho89"
+supported_extensions = "strm"
+corename = "X-Streemly"
+categories = "Media Player"
+license = "GPLv2+ (binaries GPLv3: FFmpeg with mbedTLS)"
+permissions = ""
+display_version = "0.0.1"
+
+# Hardware Information
+manufacturer = "N/A"
+systemname = "Network Video"
+systemid = "network_video"
+
+# Libretro Features
+supports_no_game = "true"
+database = ""
+savestate = "false"
+needs_fullpath = "true"
+disk_control = "false"
+is_experimental = "true"
+
+description = "Plays network video streams like TV channels: HLS and MPEG-TS over HTTP(S), M3U playlists and the free iptv-org channel lists. X-Streemly hosts no streams."

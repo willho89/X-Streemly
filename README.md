@@ -4,7 +4,8 @@ A [libretro](https://www.libretro.com/) core for **network video**: tune in to l
 channels on a TV. Built for [VRT](https://github.com/willho89/VRT) (an emulated CRT TV for Meta Quest), and usable in
 RetroArch too.
 
-> **Status: planning.** Nothing to install yet.
+> **Status: early development (M0 done).** The core builds, loads in RetroArch and connects to HLS/MPEG-TS streams
+> over HTTP(S), but doesn't show pictures or play sound yet. Nothing to install yet.
 
 ## Planned
 - **Free IPTV out of the box:** channel lists from [iptv-org](https://github.com/iptv-org/iptv), a community
