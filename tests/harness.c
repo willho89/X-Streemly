@@ -25,6 +25,7 @@
  *                                   fixtures: white-flash onsets (video) vs
  *                                   beep onsets (audio), on the audio clock
  *   HARNESS_WAV=<file>              write the audio output as a WAV
+ *   HARNESS_SLOW_US=<us>            report each retro_run slower than this
  *   HARNESS_OPT_<key>=<value>       core option value, e.g.
  *                                   HARNESS_OPT_xstreemly_verbose_log=on
  */
@@ -39,6 +40,7 @@
 #include <time.h>
 
 #include <dlfcn.h>
+#include <sys/resource.h>
 
 #include <libretro.h>
 
@@ -430,7 +432,8 @@ int main(int argc, char **argv)
    struct retro_system_av_info av;
    struct retro_game_info game = { 0 };
    bool realtime = !getenv("HARNESS_FAST");
-   double *run_s, t0, t, sum = 0;
+   double *run_s, t0, t, sum = 0, wall = 0;
+   struct rusage ru0, ru1;
 
    void (*p_retro_set_environment)(retro_environment_t);
    void (*p_retro_set_video_refresh)(retro_video_refresh_t);
@@ -501,6 +504,7 @@ int main(int argc, char **argv)
    wav_open(getenv("HARNESS_WAV"));
    run_s = calloc(frames ? frames : 1, sizeof(*run_s));
    t0 = now_s();
+   getrusage(RUSAGE_SELF, &ru0);
    for (i = 0; i < frames; i++)
    {
       g_frame_no = i;
@@ -518,10 +522,14 @@ int main(int argc, char **argv)
       p_retro_run();
       run_s[i] = now_s() - t - g_cb_s;
       sum += run_s[i];
+      if (getenv("HARNESS_SLOW_US") && run_s[i] * 1e6 > atof(getenv("HARNESS_SLOW_US")))
+         printf("slow retro_run at frame %u: %.0f us\n", i, run_s[i] * 1e6);
       if (want_dump(i))
          dump_frame(i);
    }
 
+   getrusage(RUSAGE_SELF, &ru1);
+   wall = now_s() - t0;
    t = now_s();
    p_retro_unload_game();
    printf("unload_ms %.1f\n", (now_s() - t) * 1000);
@@ -537,6 +545,11 @@ int main(int argc, char **argv)
              1e6 * run_s[(size_t)(frames * 0.99)], 1e6 * run_s[frames - 1]);
    }
    free(run_s);
+   {
+      double cpu = (ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) / 1e6 +
+                   (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec) / 1e6;
+      printf("cpu: %.0f%% of one core over %.1f s (all threads)\n", wall > 0 ? 100 * cpu / wall : 0, wall);
+   }
    printf("geometry changes %u, av_info changes %u\n", g_geom_changes, g_av_changes);
    printf("frames: %u (dupes %u) last %ux%u video_hash %016llx audio_frames %llu (expected %.0f)\n",
           g_video_frames, g_dupes, g_width, g_height,

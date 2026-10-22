@@ -86,16 +86,18 @@ README's licence section should say so once builds exist (D-004).
 │ xs_chan.c      channel list, numbering, current/last channel, persistence │
 │ xs_playlist.c  M3U/M3U8/.strm parser (attrs, VLC opts) ◄─ VLC m3u.c        │
 │ xs_iptv.c      iptv-org fetch + disk cache + filters (thread)             │
-│ xs_clock.c     presentation clock + buffer-depth controller (§5.5)        │
-│ xs_osd.c       bitmap font, banner, tuning card, static/hiss              │
-│ xs_present.c   per-tick: pick frame, emit audio (never blocks, no copy)   │
+│ xs_osd.c       5x7 bitmap font, tuning card (banner/static: M2)           │
+│ xs_present.c   per tick: clock, buffer floor controller + catch-up, pick  │
+│                frame, emit audio (never blocks, no copy)                  │
 │- - - - - - - - - - - - - - - thread boundary - - - - - - - - - - - - - - -│
 │ xs_tuner.c     TUNER THREAD: open (interrupt cb, timeouts), variant pick, │
-│                read, reconnect           ◄─ ffplay.c read_thread          │
-│ xs_video.c     VIDEO THREAD: decode (frame threads) → deint → swscale to  │
-│                XRGB8888 at native size → frame ring                       │
-│ xs_audio.c     decode → swresample 48 kHz stereo (+drift comp) → ring     │
-│ xs_fetch.c     small HTTP(S) GETs via avio (playlists, iptv-org JSON)     │
+│                timeline join, audio decode, reconnect ◄─ ffplay read_thread│
+│ xs_pktq.c      bounded video packet queue with serials ◄─ ffplay PacketQ  │
+│ xs_video.c     VIDEO THREAD: decode (frame threads) → bwdif → swscale to  │
+│                XRGB8888 at native size → frame slots (zero copy)          │
+│ xs_audio.c     decoder + swresample 48 kHz stereo (rate comp) → PCM ring  │
+│ xs_source.c    content → source (URL, headers), open with FFmpeg options  │
+│ xs_fetch.c     small HTTP(S) GETs via avio (playlists, iptv-org; M2/M3)   │
 └───────────────────────────────────────────────────────────────────────────┘
    │
  FFmpeg (avformat: hls/mpegts/mov, protocols http/https/tls/crypto) + mbedTLS
@@ -124,8 +126,8 @@ README's licence section should say so once builds exist (D-004).
 | X-Streemly module | Reference | What to take |
 |---|---|---|
 | xs_tuner.c | FFmpeg `fftools/ffplay.c` `read_thread()`, `decode_interrupt_cb`, `stream_component_open` | Threaded open/read loop, interrupt callback for abort + timeouts, packet queues, EOF handling, `infinite_buffer`/realtime detection (`is_realtime()`). |
-| xs_clock.c | ffplay `sync_clock_to_slave`, `check_external_clock_speed`, `synchronize_audio`, `compute_target_delay` | Speed nudging from queue depth for realtime sources; audio sample-count compensation; frame drop/repeat. |
-| xs_clock.c / xs_present.c | DeeVee `src/dv_clock.c`, `dv_audio.c` (PTS-chunk queue, per-tick render, segment fades), D-013 | libretro tick-driven clock, exact samples per tick, discontinuity handling, fades. |
+| xs_present.c | ffplay `sync_clock_to_slave`, `check_external_clock_speed`, `synchronize_audio`, `compute_target_delay` | Speed nudging from queue depth for realtime sources; audio sample-count compensation; frame drop/repeat. |
+| xs_present.c / xs_audio.c | DeeVee `src/dv_clock.c`, `dv_audio.c` (PTS-chunk queue, per-tick render, segment fades), D-013 | libretro tick-driven clock, exact samples per tick, discontinuity handling, fades. |
 | xs_video.c | DeeVee `dv_video.c` / `dv_render.c`, D-021 (bwdif at field rate); ffplay `video_thread`, `get_video_frame` (early frame drop) | swscale setup, BT.601/709 matrices by stream colourspace, deinterlace, dropping late frames before conversion. |
 | libretro.c | DeeVee `src/libretro.c`; RetroArch `cores/libretro-ffmpeg/ffmpeg_core.c` | Options v2, av_info/geometry changes, logging. libretro-ffmpeg: what it does about fps vs display rate and big frames; what *not* to do (file-only FIFO model). |
 | xs_playlist.c | VLC `modules/demux/playlist/m3u.c`; Kodi PVR IPTV Simple Client (`pvr.iptvsimple`) M3U parser | Attribute parsing, `#EXTVLCOPT`, `#KODIPROP`, encodings, relative URLs. |
@@ -166,6 +168,17 @@ opens URLs.
 - `avformat_find_stream_info` is slow on live HLS: cap `probesize`/`analyzeduration` (e.g. 1 MB / 2 s).
 - Failure handling: timeouts, 403/404 (likely geo-blocked/dead), no decodable video. Report a reason string for
   the OSD and for the M3 dead-stream list.
+- **Retries (M1, D-018):** a failed open is retried after 2, 4, 8 … 30 s. A connection lost *after* media flowed is
+  retried at once and **keeps the serial**: nothing buffered is dropped, and the new connection's timestamps are
+  joined right after the furthest point reached, so playback carries on through a reconnect.
+- **Live or file (D-021):** live = no duration, unless the input (not hls) has a known size (`Content-Length`):
+  FFmpeg gives MPEG-TS over HTTP no duration. Files end ("END OF STREAM"); live streams reconnect.
+- **Timeline (M1, D-023):** a packet more than 1 s *behind*, or more than 10 s *ahead of*, where its stream should
+  continue (HLS discontinuity, ad splice, wrap, encoder restart) is joined on; a smaller forward jump is a real gap
+  (segments that expired unread) and is kept, so the clock steps over it. Joins go through **epochs**: the first
+  stream to cross opens an epoch with the offset that makes it continue, and each other stream adopts that epoch's
+  offset when it crosses (if it fits). Interleaving means one stream's new timestamps arrive while another's old
+  ones still do: a single shared offset flipped back and forth (seen live: ±5.9 s on a flaky 1080i restream).
 
 ### 5.3 Stream and variant selection
 - HLS master playlists show up as several AVPrograms. Default: the **highest-resolution variant** (ties: highest
@@ -178,23 +191,25 @@ opens URLs.
   (M4).
 
 ### 5.4 Video (xs_video.c) — D-005
-- Decoders: `h264`, `hevc`, `mpeg2video`, `mpeg1video`, frame + slice threading (`thread_count` 0 = auto, capped,
-  measured in M1).
+- Decoders: `h264`, `hevc`, `mpeg2video`, `mpeg1video`, frame + slice threading with **half the CPUs**; swscale and the
+  deinterlacer get 2 threads each (D-017: auto everywhere was ~25 threads on 8 CPUs and stalled `retro_run` for
+  5–10 ms when a lock holder was preempted).
 - **Output at native resolution**, XRGB8888 via swscale with the stream's colour matrix (BT.709 for HD, BT.601 for
   SD) and range. `geometry.base_width/height` = the stream's coded display size; `aspect_ratio` from the DAR
   (SAR × size), never assumed square.
 - **Geometry changes:** `max_width/height` declared at load as 1920×1080. A channel within that changes size with
   `SET_GEOMETRY` (cheap). A larger stream (4K) raises the maximum with `SET_SYSTEM_AV_INFO` once (RetroArch
   reinitialises its video driver for that). Verify both in the user's RetroArch in M1/M2.
-- **Interlaced sources** (many broadcast IPTV feeds are 1080i/576i H.264 or MPEG-2): bwdif at field rate by default
-  (DeeVee D-021), option off/bwdif/yadif. 1080i bwdif cost to be measured in M1; fall back to yadif or frame rate if
-  it doesn't keep up.
+- **Interlaced sources** (some broadcast restreams are 1080i/576i H.264 or MPEG-2; most IPTV is progressive): bwdif
+  at field rate by default (DeeVee D-021), option off/bwdif/yadif. With *Off*, swscale converts the woven frame field
+  by field (destination flagged interlaced; the new swscale API refuses interlaced → progressive otherwise).
+- Scan type comes from the decoded frames (`AV_FRAME_FLAG_INTERLACED`), not `codecpar->field_order` (unknown in HLS).
 - Late frames are dropped before conversion (ffplay's early drop) so a slow conversion never builds latency.
 - Ring: a few ready frames (4 × 1080p XRGB ≈ 33 MB; 4K ≈ 133 MB, so the ring is sized in bytes, not frames). The
   video thread blocks (on an interruptible condvar) when full.
 - A *Max resolution* cap (§5.3) also downscales non-HLS streams, which is the hook for VRT's SD use later.
 
-### 5.5 Clock, output rate, buffering and A/V sync (xs_clock.c, xs_present.c) — D-007, D-008
+### 5.5 Clock, output rate, buffering and A/V sync (xs_present.c, xs_audio.c) — D-007, D-008, D-019, D-020
 - **Output rate:** the core declares `timing.fps` = the display rate (`RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE`,
   falling back to 60) and presents each tick the newest frame with PTS ≤ clock, so 25/30/50/60 fps streams all play
   at real speed on a 60 Hz display (with the unavoidable 50→60 cadence judder). Option *Output rate*: Auto / 60 /
@@ -204,13 +219,30 @@ opens URLs.
   exactly the tick's audio (fractional accumulator, 48000/fps).
 - **Start:** after a tune, present the tuning card until the audio ring holds the *start target* (default 1.0 s for
   network streams), then anchor `clock = first audio PTS` and start.
-- **Steady state:** the live source produces media at the broadcaster's rate, the frontend consumes at its own. The
-  buffer depth is measured each tick (smoothed). Away from the target, apply up to ±0.5 % rate change via
-  `swr_set_compensation` (inaudible) and advance the video clock by the same factor.
-- **Underrun (stall):** freeze the last picture, fade audio out (64-sample fade like DeeVee D-013), show a small
-  "signal lost" OSD after ~1 s, re-buffer to the start target, fade back in.
-- **Discontinuities:** HLS `#EXT-X-DISCONTINUITY`, ad insertion, PTS wraps (33-bit MPEG-TS), encoder restarts. Treat
-  any jump > 1 s against the expected PTS as a new segment and re-anchor (DeeVee D-013 confirm-then-act logic).
+- **The clock is the audio (D-020):** decoded audio waits in a ring of PTS-stamped chunks; the clock is the timestamp
+  of the next sample to play, and each tick shows the newest frame due by the middle of the tick. Without audio
+  the clock advances by the tick from the first frame.
+- **Steady state:** the live source produces media at the broadcaster's rate, the frontend consumes at its own. Live
+  HLS arrives in segment bursts, so the level is a saw-tooth: the controller steers its **floor** (minimum over the
+  last 20 s) to the floor target with a proportional rate change of at most ±0.5 % (0.2 % per second of error),
+  applied by `swr_set_compensation` in the producer; the clock follows automatically because chunks carry their
+  source duration. Files are not steered (they can't drift).
+- **Adaptive jitter buffer (D-022):** floor target = *Buffer* option + 1 s per underrun on this tune (max +10 s) + half
+  the burst size (the level's peak-to-trough over the window, ~one segment plus FFmpeg's reload lateness). The
+  start/re-buffer threshold is the option + underrun extra. Burst size only grows within a tune, except it is
+  relearned after a catch-up (the window held the backlog). CNBC UK (6 s segments): burst ~8 s, target ~5 s,
+  floor 2.3–3.2 s above empty, 0 underruns in 5 min; with the fixed 1 s target it underran on every segment.
+- **Catch-up (D-019):** live HLS starts `live_start_index=-3` segments back (CNBC UK: 18 s in 6 s segments, fetched
+  over the first seconds), far more than ±0.5 % can work off. When a full 20 s window's floor is > 3 s over the floor
+  target, skip the oldest audio down to target + 0.5 s (fade out/in; video frames before the new clock are dropped
+  unconverted), then wait for a fresh window. Judged on the floor, never the instantaneous level, so a skip can't
+  cut into the wait for the next segment. It also absorbs a frontend that runs slow (below the declared rate the
+  buffer grows; seen when the Deck was decoding three 1080p streams at once).
+- Stats line every minute (INFO): state, measured ticks/s, buffer / floor / target, rate correction, frames shown /
+  dropped, underruns, convert and decode times.
+- **Underrun (stall):** freeze the last picture, fade audio out (64-sample fade like DeeVee D-013), after ~1 s show
+  the NO SIGNAL / BUFFERING card, re-buffer to the start target, fade back in.
+- **Discontinuities:** joined on the tuner's timeline (§5.2), so the presenter sees one continuous clock.
 - Fast-forward (RetroArch throttle state): not meaningful for live; drop video, keep the clock tied to the buffer.
 - **Low-latency mode** (companion app, later): same controller with a ~100 ms target instead of ~1 s.
 
@@ -430,7 +462,7 @@ guide listing the channels, content folder (`m3u` is also claimed by `pcsx_rearm
 |---|---|---|
 | Plan | ☑ Approved (2026-10-21) | All §13 proposals accepted by the user. |
 | M0 Skeleton | ☑ Done (2026-10-21) | Submodules FFmpeg n8.1.3, mbedTLS v3.6.7, libretro-common master (a3194c1). `Makefile.deps` builds both static (mbedTLS from a copy in `build/mbedtls/src`, its own Makefile). Core: `libretro.c` (options v2, FFmpeg log bridge, display-rate timing via GET_TARGET_REFRESH_RATE, black 640×360 frame then dupes, exact silence per tick, SET_MESSAGE_EXT status), `xs_source.c` (.strm / URL → source, open with headers, timeouts, reconnect, live_start_index, protocol whitelist), `xs_tuner.c` (thread, mailbox, interrupt callback for abort + 15 s open / 20 s data deadlines, stream-info log, packet read loop). `tests/harness.c` (real-time pacing, retro_run mean/p99/max excluding its own callbacks, unload time, OSD lines), `tests/server.py` (HTTP(S), looping live.m3u8 from vod.m3u8, `_delay/_status/_stall/_drop`), `tests/fixtures/make_fixtures.sh` (hls2 720p+1080p, i1080, i576 MPEG-2, p2997 AC-3, p50, HEVC/E-AC-3, TLS cert), `tests/check.sh`. **make check: 10/10 pass** (HTTPS HLS opens in ~0.5 s with both variants; retro_run max ≤ 111 µs; unload while connecting 4–6 ms; 404 → No signal). Core NEEDED = libc, libm only; 25 exports; glibc floor 2.35. **Acceptance in the user's Steam RetroArch** (copied config, `-L`): HTTPS HLS fixture opened in 465 ms, same stream log, OSD summary shown, tuner stopped in 8 ms on quit. **Next: M1.** |
-| M1 One stream | ☐ | |
+| M1 One stream | ☑ Done (2026-10-22) | Tuner thread (variant pick, timeline epochs D-023, inline audio decode, retries/reconnect D-018), `xs_pktq` + video thread (frame threads, bwdif/yadif at field rate, swscale threaded into zero-copy slots, early drop), audio ring as the clock (D-020) with floor controller, adaptive jitter buffer and live-edge catch-up (D-019, D-022), presenter with tuning/no-signal/end cards (5×7 OSD font), wall-clock stats line. **make check 18/18** (A/V within 4.7–14 ms on every fixture, ≤ 40 ms at loop joins; field rate; caps; stall, gaps, file end). **Harness 30 min live HLS 1080p:** 1800/1800 flashes matched, mean +1.5 ms, worst +40.3 ms (at loop joins), 0 clicks/underruns/drops, 90 joins, 48 % of one core. **RetroArch 30 min, CNBC UK 1080p (public):** 59.95 ticks/s, 0 underruns, 7 drops at start, 295–299 MB flat, ~130 % CPU (whole frontend), two ad-splice discontinuities joined. **RetroArch 30 min, live 1080i (local fixture, public 1080i unsustainable: see notes):** 60.16 ticks/s, 90,480 pictures (50.3/s), 1 drop, 0 underruns, 91 joins, 279 MB flat, ~160 % CPU. Not done: A/V measured only in the harness; >1080p and AES-128 HLS untested; `retro_run` max can reach ~5 ms while the desktop is busy (make check limit 5 ms may flake). **Next: M2.** |
 | M2 Playlists | ☐ | |
 | M3 iptv-org | ☐ | |
 | M4 Robustness | ☐ | |
@@ -461,6 +493,17 @@ guide listing the channels, content folder (`m3u` is also claimed by `pcsx_rearm
   still writes `config/X-Streemly/X-Streemly.opt` in its own dir on exit. Kill by PID (`pgrep -x retroarch`), never
   `pkill -f` from a shell whose command line contains the pattern. A `spectacle -b -n -f` screenshot captures the
   whole desktop (the user's other windows): delete it after checking.
+- **Unattended RetroArch runs need `video_vsync = "false"` in the test config** (2026-10-22): with vsync on and the
+  RetroArch window hidden or covered (the user working on the desktop), the GL swap inside `video_cb` waits on
+  Wayland frame callbacks that never come and times out after 1 s, so `retro_run` takes 1000 ms and RetroArch runs
+  at ~1 tick/s (the core logs it: "retro_run mean 982 ms … (incl. frontend callbacks)"). Audio sync paces the
+  run instead (60.2 ticks/s). `ptrace` (eu-stack, gdb) is blocked inside the Steam runtime.
+- Don't run several 1080p tests at once on the Deck: RetroArch fell to ~50 ticks/s while two harness runs decoded
+  alongside it (the buffer then grows and catch-up absorbs it, but the results are no longer comparable).
+- Real interlaced IPTV is rare: of 22 iptv-org entries labelled 1080i that answered, 3 decode as interlaced, all from
+  one restream server (92.114.85.87) that delivers ~1.4 Mbit/s, below the channels' bitrate, and drops the
+  connection every few minutes. The core rides it (reconnects joined, adaptive target 2.9 → 7.8 s, holds the
+  picture through each stall) but it can't be a 30-minute acceptance source; the local live `hls_i1080` fixture is.
 - iptv-org country playlists use `uk`, not ISO `gb` (`countries/gb.m3u` is a 404).
 - iptv-org `streams.json` carries per-stream `referrer` and `user_agent`; the M3U lists carry them as
   `#EXTVLCOPT` lines. Some streams don't play without them.
@@ -490,6 +533,13 @@ guide listing the channels, content folder (`m3u` is also claimed by `pcsx_rearm
 | D-014 | X-Streemly is a libretro core first; VRT integration is a separate phase after v1, out of scope for this plan. | User (2026-10-21). | **Accepted (user, 2026-10-21)** |
 | D-015 | Linux x86_64 is the only target until M5; Android and others come with distribution. | Follows from D-014; Quest was the only reason for early Android. | **Accepted (user, 2026-10-21)** |
 | D-016 | Manual and acceptance testing in the user's Steam RetroArch (not VRT), with DeeVee's safe-launch rules (§8). | User (2026-10-21). | **Accepted (user, 2026-10-21)** |
+| D-017 | Decoder threads = half the CPUs; swscale and the deinterlace graph 2 threads each. | With FFmpeg's auto threading (~25 threads on the Deck's 8 CPUs) a preempted lock holder stalled `retro_run` 5–10 ms; capped: no tick over 1.5 ms in repeated runs, and less CPU. | Accepted (2026-10-21, M1) |
+| D-018 | A reconnect after media flowed keeps the serial and joins the new connection's timeline after the furthest point reached; only a fresh tune or a failed first open starts a new serial. | Starting over dropped up to 20 s of buffered media and reset the picture on every hiccup. | Accepted (2026-10-21, M1) |
+| D-019 | Live-edge catch-up: skip once when a full 20 s floor window is > 3 s over target, down to target + 0.5 s. | `live_start_index=-3` gives 6–18 s of backlog that ±0.5 % would take up to an hour to work off; judging by the floor keeps the skip clear of the next segment's wait (judging by the level caused underruns on CNBC UK). | Accepted (2026-10-21, M1) |
+| D-020 | The audio ring is the clock (next sample's PTS); D-007's controller steers the 20 s buffer floor, not a smoothed level. | Lip sync is exact by construction (fixtures: within a few ms); the floor is what matters with segment bursts. | Accepted (2026-10-21, M1), refines D-007 |
+| D-022 | Adaptive jitter buffer: floor target = option + 1 s per underrun (≤ +10 s) + half the observed burst. | A fixed 1 s floor underran on every 6 s CNBC segment (FFmpeg finds new segments up to half a target duration late); adaptive: 0 underruns. | Accepted (2026-10-22, M1) |
+| D-023 | Timeline joins per stream through shared epochs; forward jumps ≤ 10 s are kept as gaps, only backward jumps > 1 s and forward > 10 s are joined. | One shared offset ping-ponged when streams crossed a jump at different times (interleaving), shifting A/V by seconds; expired segments are missing content, not a timeline break. Fixture `/_gap/` (content gaps, numbering intact) in make check. | Accepted (2026-10-22, M1) |
+| D-021 | Live = no duration and (for non-hls inputs) no known size. | FFmpeg reports no duration for MPEG-TS over HTTP, so files were taken for live streams and "reconnected" in a loop. | Accepted (2026-10-21, M1) |
 
 ---
 

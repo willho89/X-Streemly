@@ -4,12 +4,16 @@
 #   tests/fixtures/make_fixtures.sh <out_dir>
 #
 # Every stream carries the A/V-sync pattern used by the harness
-# (HARNESS_AVSYNC): a 2-frame white flash on black and a 100 ms 1 kHz beep at
-# the start of every second. Needs ffmpeg (libx264, libx265) and openssl.
+# (HARNESS_AVSYNC): a 2-frame white flash on black and a 100 ms 1 kHz beep
+# (-20 dBFS) at the start of every second. A moving test pattern (testsrc2)
+# fills the top eighth of the picture, above the harness's 5x5 sampling grid,
+# so colour, geometry and motion can be checked by eye. Needs ffmpeg
+# (libx264, libx265) and openssl.
 #
 #   hls2/       live-style HLS: master.m3u8 with 720p + 1080p variants
 #               (H.264 + AAC, 25 fps, 2 s segments, 20 s). tests/server.py
 #               turns each variant's vod.m3u8 into a looping live.m3u8.
+#   hls_i1080/  live-style HLS, 1080i25 H.264 (tff) + AC-3, 20 s (live.m3u8)
 #   i1080.ts    1080i25 H.264 (tff) + AAC, 10 s
 #   i576.ts     576i25 MPEG-2 (tff) + MP2, 10 s
 #   p2997.ts    1080p29.97 H.264 + AC-3, 10 s
@@ -22,13 +26,15 @@ OUT=${1:?usage: make_fixtures.sh <out_dir>}
 mkdir -p "$OUT"
 FF="ffmpeg -nostdin -hide_banner -loglevel error -y"
 
-# video: black, white for 2 frames at the start of every second
-video() { # size rate seconds
-   echo "color=c=black:s=$1:r=$2:d=$3,drawbox=c=white:t=fill:enable='lt(mod(n\,round($2)),2)'"
+# video: black with a test-pattern strip on top, white for 2 frames at the
+# start of every second
+video() { # WxH rate seconds
+   w=${1%x*}; h=${1#*x}; sh=$(( (h / 8) / 2 * 2 ))
+   echo "color=c=black:s=$1:r=$2:d=$3[bg];testsrc2=s=${w}x$sh:r=$2:d=$3[ts];[bg][ts]overlay=0:0,drawbox=c=white:t=fill:enable='lt(mod(n\,round($2)),2)'"
 }
 # audio: 100 ms 1 kHz beep at the start of every second
 audio() { # seconds
-   echo "aevalsrc='if(lt(mod(t\,1)\,0.1)\,0.5*sin(2*PI*1000*t)\,0)|if(lt(mod(t\,1)\,0.1)\,0.5*sin(2*PI*1000*t)\,0)':s=48000:d=$1"
+   echo "aevalsrc='if(lt(mod(t\,1)\,0.1)\,0.1*sin(2*PI*1000*t)\,0)|if(lt(mod(t\,1)\,0.1)\,0.1*sin(2*PI*1000*t)\,0)':s=48000:d=$1"
 }
 
 X264="-c:v libx264 -preset ultrafast -pix_fmt yuv420p"
@@ -51,6 +57,13 @@ v720/live.m3u8
 v1080/live.m3u8
 EOF
 sed 's/live\.m3u8/vod.m3u8/' "$OUT/hls2/master.m3u8" > "$OUT/hls2/master_vod.m3u8"
+
+echo "== hls_i1080 (live-style HLS, 1080i25 H.264 + AC-3, 20 s)"
+mkdir -p "$OUT/hls_i1080"
+$FF -f lavfi -i "$(video 1920x1080 50 20),tinterlace=interleave_top,setfield=tff" -f lavfi -i "$(audio 20)" \
+   $X264 -flags +ildct+ilme -x264-params tff=1 -b:v 6M -g 50 -keyint_min 50 -sc_threshold 0 -c:a ac3 -b:a 192k \
+   -f hls -hls_time 2 -hls_playlist_type vod \
+   -hls_segment_filename "$OUT/hls_i1080/seg_%03d.ts" "$OUT/hls_i1080/vod.m3u8"
 
 echo "== i1080.ts (1080i25 H.264)"
 $FF -f lavfi -i "$(video 1920x1080 50 10),tinterlace=interleave_top,setfield=tff" -f lavfi -i "$(audio 10)" \

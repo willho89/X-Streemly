@@ -73,6 +73,28 @@ static bool read_strm(const char *path, char *url, size_t len)
    return ok;
 }
 
+/* Display name: the content file's name without its extension, else the
+ * URL's host. */
+static void name_from(xs_source_t *src, const char *content)
+{
+   const char *p;
+   size_t n;
+   if (content)
+   {
+      const char *base = strrchr(content, '/');
+      const char *dot;
+      base = base ? base + 1 : content;
+      dot  = strrchr(base, '.');
+      n = dot && dot > base ? (size_t)(dot - base) : strlen(base);
+      snprintf(src->name, sizeof(src->name), "%.*s", (int)n, base);
+      return;
+   }
+   p = strstr(src->url, "://");
+   p = p ? p + 3 : src->url;
+   n = strcspn(p, "/:?#");
+   snprintf(src->name, sizeof(src->name), "%.*s", (int)n, p);
+}
+
 bool xs_source_from_content(xs_ctx_t *ctx, const char *path, xs_source_t *src,
                             char *err, size_t errlen)
 {
@@ -94,6 +116,7 @@ bool xs_source_from_content(xs_ctx_t *ctx, const char *path, xs_source_t *src,
    }
    if (!is_url(src->url))
       src->local = true;   /* a .strm may name a local file (tests) */
+   name_from(src, is_url(path) ? NULL : path);
    XS_DEBUG(ctx, "source: %s\n", src->url);
    return true;
 }

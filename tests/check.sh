@@ -73,60 +73,134 @@ check_common() {
 
 ok() { echo "   $NAME: ok${1:+ ($1)}"; }
 
+# check_avsync <min matched flashes> <max |offset| ms>: lip sync on the
+# flash + beep pattern every fixture carries, and no clicks.
+check_avsync() {
+   line=$(grep '^avsync: flashes' "$LOG") || fail "no avsync report"
+   matched=$(echo "$line" | sed -E 's/.*matched ([0-9]+).*/\1/')
+   worst=$(echo "$line" | sed -E 's/.*min ([-+0-9.]+) max ([-+0-9.]+).*/\1 \2/' |
+           awk '{a = $1 < 0 ? -$1 : $1 + 0; b = $2 < 0 ? -$2 : $2 + 0; print (a > b ? a : b)}')
+   [ "$matched" -ge "$1" ] || fail "only $matched flashes matched a beep (want >= $1)"
+   awk -v w="$worst" -v m="$2" 'BEGIN { exit !(w <= m) }' || fail "A/V offset $worst ms > $2 ms"
+   grep -qE '^avsync: clicks 0 ' "$LOG" || fail "clicks: $(grep '^avsync: clicks' "$LOG")"
+   AVS="A/V within ${worst} ms over $matched flashes"
+}
+
+# segments of an HLS variant requested from a server log
+segs() { grep -c "REQ GET .*/$2/seg_" "$WORK/server_$1.log"; }
+
 start_server HTTPS --tls
 start_server HTTP
 
-echo "== M0: open over HTTPS (mbedTLS) and HTTP, log what each source offers"
+echo "== M1: play over HTTPS (mbedTLS) and HTTP at native resolution, in sync"
 
-run hls2_https "$HTTPS/hls2/master.m3u8" 240
+run hls2_https "$HTTPS/hls2/master.m3u8" 900 HARNESS_AVSYNC=1
 expect 'opened in [0-9]+ ms: format hls, live, 2 program\(s\), 4 stream\(s\)'
-expect 'program 0: bandwidth 1700000'
-expect 'program 1: bandwidth 4300000'
-expect 'video: h264 1280x720 '
-expect 'video: h264 1920x1080 '
-expect 'audio: aac 48000 Hz stereo'
-expect 'first packet [0-9]+ ms after tune'
-expect 'OSD: h264 '
-expect_no 'open failed|Signal lost'
+expect 'variant: program 1, 1920x1080, 4300 kb/s'
+expect 'playing after'
+expect 'geometry 1920x1080 aspect 1\.7778'
+expect_no 'open failed|Signal lost|audio underrun'
 check_common
-ok "$(awk '/opened in/{print $6" ms to open"; exit}' "$LOG"), $(awk '/^run_us:/{print "retro_run max "$7" us"}' "$LOG")"
+check_avsync 12 40
+v720=$(segs HTTPS v720)
+[ "$v720" -le 3 ] || fail "the 720p variant kept downloading ($v720 segments)"
+ok "1080p variant (720p: $v720 probe segments), $AVS, $(awk '/^run_us:/{print "retro_run max "$7" us"}' "$LOG"), $(awk '/^cpu:/{print $2" CPU"}' "$LOG")"
 
-run i1080 "$HTTPS/i1080.ts" 120
-expect 'video: h264 1920x1080 SAR 1:1 25\.000 fps scan i tff'
-expect 'audio: aac 48000 Hz'
+run i1080 "$HTTPS/i1080.ts" 720 HARNESS_AVSYNC=1
+expect 'video: h264 1920x1080 yuv420p, interlaced tff'
+expect 'deinterlacing with bwdif at field rate'
 expect 'end of stream'
 check_common
-ok "1080i tff"
+check_avsync 9 40
+shown=$(grep -oE 'shown [0-9]+' "$LOG" | tail -1 | cut -d' ' -f2)
+[ "$shown" -ge 480 ] || fail "only $shown pictures shown: not field rate"
+ok "1080i25 -> $shown pictures in 10 s, $AVS"
 
-run i576_http "$HTTP/i576.ts" 120
-expect 'video: mpeg2video 720x576 SAR 64:45 25\.000 fps scan i tff'
-expect 'audio: mp2 48000 Hz'
+run i576_http "$HTTP/i576.ts" 720 HARNESS_AVSYNC=1
+expect 'video: mpeg2video 720x576 yuv420p, interlaced tff'
+expect 'geometry 720x576 aspect 1\.7778'
 check_common
-ok "576i tff, plain HTTP"
+check_avsync 9 40
+ok "576i MPEG-2, 16:9 from 64:45 pixels, plain HTTP, $AVS"
 
-run p2997 "$HTTPS/p2997.ts" 120
-expect 'video: h264 1920x1080 SAR 1:1 29\.970 fps scan p'
+run p2997 "$HTTPS/p2997.ts" 720 HARNESS_AVSYNC=1
 expect 'audio: ac3 48000 Hz'
+expect 'geometry 1920x1080 '
 check_common
-ok "29.97p + AC-3"
+check_avsync 9 40
+ok "1080p29.97 + AC-3, $AVS"
 
-run p50 "$HTTPS/p50.ts" 120
-expect 'video: h264 1280x720 SAR 1:1 50\.000 fps scan p'
+run p50 "$HTTPS/p50.ts" 720 HARNESS_AVSYNC=1
+expect 'geometry 1280x720 '
 check_common
-ok "720p50"
+check_avsync 9 40
+ok "720p50, $AVS"
 
-run hevc "$HTTPS/hevc.ts" 120
-expect 'video: hevc 1280x720 '
+run hevc "$HTTPS/hevc.ts" 480 HARNESS_AVSYNC=1
+expect 'video: hevc 1280x720'
 expect 'audio: eac3 48000 Hz'
 check_common
-ok "HEVC + E-AC-3"
+check_avsync 5 40
+ok "HEVC + E-AC-3, $AVS"
 
-run local_file "$(pwd)/$FIX/p50.ts" 60
+run local_file "$(pwd)/$FIX/p50.ts" 120
 expect 'format mpegts, fixed length'
+expect 'playing after'
 check_common
 ok "local file in a .strm"
 
-echo "== M0: failures never block the frontend"
+echo "== M1: options"
+
+run cap720 "$HTTPS/hls2/master.m3u8" 300 HARNESS_OPT_xstreemly_max_resolution=720
+expect 'variant: program 0, 1280x720, 1700 kb/s .* within the resolution cap'
+expect 'geometry 1280x720 '
+check_common
+ok "Max Resolution 720p -> 720p variant"
+
+run cap720_scale "$HTTPS/i1080.ts" 240 HARNESS_OPT_xstreemly_max_resolution=720
+expect 'geometry 1280x720 '
+check_common
+ok "Max Resolution 720p -> 1080i scaled to 1280x720"
+
+run deint_off "$HTTPS/i1080.ts" 300 HARNESS_OPT_xstreemly_deinterlace=off HARNESS_AVSYNC=1
+expect_no 'Cannot convert|convert:'
+expect_no 'deinterlacing'
+check_common
+check_avsync 3 40
+ok "Deinterlace off: woven frames"
+
+run yadif "$HTTPS/i1080.ts" 720 HARNESS_OPT_xstreemly_deinterlace=yadif HARNESS_AVSYNC=1
+expect 'deinterlacing with yadif at field rate'
+check_common
+check_avsync 9 40
+shown=$(grep -oE 'shown [0-9]+' "$LOG" | tail -1 | cut -d' ' -f2)
+[ "$shown" -ge 480 ] || fail "only $shown pictures shown: not field rate"
+ok "Deinterlace yadif: $shown pictures in 10 s, $AVS"
+
+echo "== M1: stalls and endings"
+
+run stall "$HTTPS/_hiccup/12/9000/hls2/master.m3u8" 1500 HARNESS_AVSYNC=1
+expect 'audio underrun .*re-buffering'
+expect 'resumed after'
+check_common
+check_avsync 15 40
+ok "9 s stall: holds the picture, re-buffers, resumes; $AVS"
+
+run gaps "$HTTPS/_gap/4/hls2/master.m3u8" 1500 HARNESS_AVSYNC=1
+expect 'playing after'
+check_common
+check_avsync 15 40
+joins=$(grep -c 'discontinuity of' "$LOG")
+[ "$joins" -le 2 ] || fail "$joins joins: forward gaps must be kept, only the 20 s loop joined"
+ok "missing segments kept as gaps ($joins loop joins), $AVS"
+
+run vod_end "$HTTPS/p50.ts" 780
+expect 'end of stream'
+expect 'geometry 640x360 '
+check_common
+ok "file plays to its end, then the card"
+
+echo "== failures never block the frontend"
 
 run http_404 "$HTTPS/_status/404/hls2/master.m3u8" 60
 expect 'open failed: No signal \(.*404'

@@ -5,26 +5,31 @@
  *
  * libretro entry points (CLAUDE.md §3). The only file allowed globals.
  *
- * M0: tunes the content's URL on the tuner thread and logs what it finds;
- * presents a black picture and silence at the display rate meanwhile.
+ * Content -> source -> tuner; each retro_run asks the presenter for the
+ * tick's audio and picture and hands them on (CLAUDE.md §5.5, D-008).
  */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <math.h>
+
 #include <libretro.h>
 #include <libavformat/avformat.h>
 #include <libavutil/log.h>
+#include <libavutil/time.h>
 #include <rthreads/rthreads.h>
 
 #include "xs_ctx.h"
+#include "xs_present.h"
 #include "xs_source.h"
 #include "xs_tuner.h"
 
-/* Until a stream gives its size (M1): a small black 16:9 picture. */
-#define XS_IDLE_WIDTH   640
-#define XS_IDLE_HEIGHT  360
+/* Declared at load: the tuning card's size, room for 1080p. A bigger stream
+ * raises the maximum with SET_SYSTEM_AV_INFO (§5.4). */
+#define XS_BASE_WIDTH   640
+#define XS_BASE_HEIGHT  360
 #define XS_MAX_WIDTH    1920
 #define XS_MAX_HEIGHT   1080
 #define XS_DEFAULT_FPS  60.0
@@ -40,19 +45,23 @@ static retro_log_printf_t         log_cb;
 static xs_ctx_t   g_ctx_storage;
 static xs_ctx_t  *g_ctx;
 static bool       g_can_dupe;
-static bool       g_frame_sent;
 static double     g_fps = XS_DEFAULT_FPS;
 static double     g_audio_accum;
 static xs_source_t g_source;
 static bool       g_have_source;
+static xs_present_t *g_present;
 
-/* Last tuner status shown on the OSD. */
-static unsigned         g_osd_gen;
+/* What the frontend currently believes. */
+static struct retro_system_av_info g_av;
+
+/* Last tuner status shown as a frontend message. */
+static unsigned         g_osd_gen, g_osd_serial;
+static unsigned         g_played_serial;   /* last serial seen playing */
 static xs_tuner_state_t g_osd_state;
 
-static uint32_t g_black[XS_IDLE_WIDTH * XS_IDLE_HEIGHT];
-#define XS_AUDIO_CHUNK 1024
-static int16_t  g_silence[2 * XS_AUDIO_CHUNK];
+/* One tick of audio at the lowest supported display rate (23 Hz). */
+#define XS_AUDIO_MAX_TICK 2100
+static int16_t  g_audio[2 * XS_AUDIO_MAX_TICK];
 
 /* ---- logging ------------------------------------------------------------ */
 
@@ -143,11 +152,45 @@ static void show_message(unsigned ms, bool alert, const char *fmt, ...)
 /* ---- core options --------------------------------------------------------- */
 
 static struct retro_core_option_v2_category g_opt_categories[] = {
-   { "advanced", "Advanced", "Logging." },
+   { "video", "Video", "Resolution and deinterlacing." },
+   { "advanced", "Advanced", "Buffering and logging." },
    { NULL, NULL, NULL },
 };
 
 static struct retro_core_option_v2_definition g_opt_defs[] = {
+   {
+      "xstreemly_max_resolution", "Max Resolution", NULL,
+      "Highest picture height to use. Streams that offer several qualities (HLS) play the best "
+      "one within this; others are scaled down to it. Applies at the next tune.",
+      NULL, "video",
+      { { "native", "Native" }, { "1080", "1080p" }, { "720", "720p" }, { "576", "576p" },
+        { "480", "480p" }, { NULL, NULL } },
+      "native"
+   },
+   {
+      "xstreemly_deinterlace", "Deinterlace", NULL,
+      "For interlaced broadcasts (1080i, 576i, 480i). Field-rate modes show every field, "
+      "for smooth motion. Progressive pictures are never touched.",
+      NULL, "video",
+      { { "bwdif", "Bwdif, field rate" }, { "yadif", "Yadif, field rate" }, { "off", "Off" },
+        { NULL, NULL } },
+      "bwdif"
+   },
+   {
+      "xstreemly_osd", "Show OSD", NULL,
+      "Text on the tuning card and status messages.",
+      NULL, "video",
+      { { "on", "On" }, { "off", "Off" }, { NULL, NULL } },
+      "on"
+   },
+   {
+      "xstreemly_buffer", "Buffer", NULL,
+      "How much to buffer before playing, and the least kept while playing. More rides out a "
+      "shaky connection; less starts sooner.",
+      NULL, "advanced",
+      { { "500", "0.5 s" }, { "1000", "1 s" }, { "2000", "2 s" }, { "4000", "4 s" }, { NULL, NULL } },
+      "1000"
+   },
    {
       "xstreemly_verbose_log", "Verbose Logging", NULL,
       "Log FFmpeg's connection and stream details (every playlist and segment request).",
@@ -203,6 +246,24 @@ static void read_options(xs_ctx_t *ctx)
    const char *v = get_option("xstreemly_verbose_log");
    ctx->opt.verbose = v && !strcmp(v, "on");
    av_log_set_level(ctx->opt.verbose ? AV_LOG_VERBOSE : AV_LOG_WARNING);
+
+   v = get_option("xstreemly_max_resolution");
+   ctx->opt.max_height = v && strcmp(v, "native") ? (unsigned)atoi(v) : 0;
+   v = get_option("xstreemly_deinterlace");
+   ctx->opt.deint = !v || !strcmp(v, "bwdif") ? XS_DEINT_BWDIF :
+                    !strcmp(v, "yadif") ? XS_DEINT_YADIF : XS_DEINT_OFF;
+   v = get_option("xstreemly_osd");
+   ctx->opt.osd = !v || strcmp(v, "off");
+   v = get_option("xstreemly_buffer");
+   ctx->opt.buffer_ms = v ? (unsigned)atoi(v) : 1000;
+   if (ctx->opt.buffer_ms < 200 || ctx->opt.buffer_ms > 10000)
+      ctx->opt.buffer_ms = 1000;
+
+   if (ctx->tuner)
+   {
+      xs_tuner_set_max_height(ctx->tuner, ctx->opt.max_height);
+      xs_video_set_options(xs_tuner_video(ctx->tuner), ctx->opt.deint, ctx->opt.max_height);
+   }
 }
 
 /* ---- libretro API ----------------------------------------------------- */
@@ -265,13 +326,14 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
 {
    memset(info, 0, sizeof(*info));
-   info->geometry.base_width   = XS_IDLE_WIDTH;
-   info->geometry.base_height  = XS_IDLE_HEIGHT;
+   info->geometry.base_width   = XS_BASE_WIDTH;
+   info->geometry.base_height  = XS_BASE_HEIGHT;
    info->geometry.max_width    = XS_MAX_WIDTH;
    info->geometry.max_height   = XS_MAX_HEIGHT;
    info->geometry.aspect_ratio = 16.0f / 9.0f;
    info->timing.fps            = g_fps;
    info->timing.sample_rate    = XS_SAMPLE_RATE;
+   g_av = *info;
 }
 
 RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) { }
@@ -282,13 +344,13 @@ RETRO_API void retro_reset(void)
       xs_tuner_tune(g_ctx->tuner, &g_source);   /* re-tune */
 }
 
-/* Display-rate output (D-008): frames are presented by PTS from M1 on, so
- * the core runs at whatever the frontend's display runs at. */
+/* Display-rate output (D-008): frames are presented by PTS, so the core
+ * runs at whatever the frontend's display runs at. */
 static void query_display_rate(void)
 {
    float rate = 0;
    g_fps = XS_DEFAULT_FPS;
-   if (environ_cb(RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE, &rate) && rate >= 23.0f && rate <= 300.0f)
+   if (environ_cb(RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE, &rate) && rate >= 23.0f && rate <= 240.0f)
       g_fps = rate;
    XS_INFO(g_ctx, "output rate %.3f Hz\n", g_fps);
 }
@@ -309,28 +371,38 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    query_display_rate();
    XS_INFO(g_ctx, "X-Streemly %s, %s\n", XS_VERSION, avformat_configuration()[0] ? "FFmpeg " LIBAVFORMAT_IDENT : "");
 
-   g_frame_sent  = false;
    g_audio_accum = 0;
    g_osd_gen     = 0;
+   g_osd_serial  = 0;
+   g_played_serial = 0;
    g_osd_state   = XS_TUNER_IDLE;
    g_have_source = false;
+
+   if (game && game->path &&
+       !xs_source_from_content(g_ctx, game->path, &g_source, err, sizeof(err)))
+   {
+      XS_ERROR(g_ctx, "%s\n", err);
+      return false;
+   }
 
    g_ctx->tuner = xs_tuner_new(g_ctx);
    if (!g_ctx->tuner)
       return false;
+   g_present = xs_present_new(g_ctx, g_ctx->tuner);
+   if (!g_present)
+   {
+      xs_tuner_free(g_ctx->tuner);
+      g_ctx->tuner = NULL;
+      return false;
+   }
+   read_options(g_ctx);   /* again, now that the tuner exists */
 
    if (!game || !game->path)
    {
       show_message(6000, false, "No content: load a .strm file to tune a stream");
       return true;
    }
-   if (!xs_source_from_content(g_ctx, game->path, &g_source, err, sizeof(err)))
-   {
-      XS_ERROR(g_ctx, "%s\n", err);
-      xs_tuner_free(g_ctx->tuner);
-      g_ctx->tuner = NULL;
-      return false;
-   }
+   xs_present_set_name(g_present, g_source.name);
    g_have_source = true;
    xs_tuner_tune(g_ctx->tuner, &g_source);
    return true;
@@ -343,6 +415,12 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 
 RETRO_API void retro_unload_game(void)
 {
+   if (g_present)
+   {
+      xs_present_log_stats(g_present);
+      xs_present_free(g_present);
+      g_present = NULL;
+   }
    if (g_ctx && g_ctx->tuner)
    {
       xs_tuner_free(g_ctx->tuner);
@@ -358,51 +436,97 @@ static void update_osd(void)
    if (!g_ctx->tuner)
       return;
    xs_tuner_get_status(g_ctx->tuner, &st);
-   if (st.gen == g_osd_gen && st.state == g_osd_state)
+   if (st.gen == g_osd_gen && st.serial == g_osd_serial && st.state == g_osd_state)
       return;
-   g_osd_gen   = st.gen;
-   g_osd_state = st.state;
+   g_osd_gen    = st.gen;
+   g_osd_serial = st.serial;
+   g_osd_state  = st.state;
+   if (!g_ctx->opt.osd)
+      return;
    switch (st.state)
    {
-      case XS_TUNER_CONNECTING: show_message(15000, false, "Tuning..."); break;
-      case XS_TUNER_PLAYING:    show_message(4000, false, "%s", st.msg); break;
-      case XS_TUNER_FAILED:     show_message(6000, true, "%s", st.msg); break;
-      case XS_TUNER_ENDED:      show_message(4000, false, "%s", st.msg); break;
+      case XS_TUNER_PLAYING:
+         if (st.serial != g_played_serial)   /* not on a reconnect */
+            show_message(4000, false, "%s", st.msg);
+         g_played_serial = st.serial;
+         break;
+      case XS_TUNER_FAILED:
+         /* A loss mid-stream reconnects behind the buffer; if the picture
+          * does stall, the NO SIGNAL card says so. */
+         if (st.serial != g_played_serial)
+            show_message(6000, true, "%s", st.msg);
+         break;
       default: break;
    }
 }
 
-static void output_audio(void)
+/* Tell the frontend about a new picture size or shape (§5.4): a cheap
+ * SET_GEOMETRY within the declared maximum, SET_SYSTEM_AV_INFO beyond it. */
+static void update_geometry(const xs_picture_t *pic)
 {
-   unsigned n;
-   g_audio_accum += XS_SAMPLE_RATE / g_fps;
-   n = (unsigned)g_audio_accum;
-   g_audio_accum -= n;
-   while (n)
+   struct retro_game_geometry *g = &g_av.geometry;
+   if (pic->width == g->base_width && pic->height == g->base_height &&
+       fabsf(pic->aspect - g->aspect_ratio) < 0.001f)
+      return;
+   g->base_width   = pic->width;
+   g->base_height  = pic->height;
+   g->aspect_ratio = pic->aspect;
+   if (pic->width > g->max_width || pic->height > g->max_height)
    {
-      unsigned chunk = n > XS_AUDIO_CHUNK ? XS_AUDIO_CHUNK : n;
-      audio_batch_cb(g_silence, chunk);
-      n -= chunk;
+      g->max_width  = pic->width > g->max_width ? pic->width : g->max_width;
+      g->max_height = pic->height > g->max_height ? pic->height : g->max_height;
+      XS_INFO(g_ctx, "picture %ux%u: raising the maximum to %ux%u\n", pic->width, pic->height,
+              g->max_width, g->max_height);
+      environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &g_av);
+   }
+   else
+   {
+      XS_DEBUG(g_ctx, "geometry %ux%u aspect %.4f\n", pic->width, pic->height, pic->aspect);
+      environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, g);
    }
 }
 
 RETRO_API void retro_run(void)
 {
-   bool updated = false;
+   xs_picture_t pic;
+   bool updated = false, resized;
+   unsigned n;
+   struct retro_game_geometry before = g_av.geometry;
+   static int64_t last_end;
+   int64_t start = av_gettime_relative();
 
+   if (last_end && start - last_end > g_ctx->run.gap_max_us)
+      g_ctx->run.gap_max_us = start - last_end;
    input_poll_cb();
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       read_options(g_ctx);
    update_osd();
 
-   if (!g_frame_sent || !g_can_dupe)
-   {
-      video_cb(g_black, XS_IDLE_WIDTH, XS_IDLE_HEIGHT, XS_IDLE_WIDTH * sizeof(uint32_t));
-      g_frame_sent = true;
-   }
+   g_audio_accum += XS_SAMPLE_RATE / g_fps;
+   n = (unsigned)g_audio_accum;
+   if (n > XS_AUDIO_MAX_TICK)
+      n = XS_AUDIO_MAX_TICK;
+   g_audio_accum -= n;
+
+   xs_present_tick(g_present, g_fps, g_audio, n, &pic);
+   update_geometry(&pic);
+   resized = before.base_width != g_av.geometry.base_width ||
+             before.base_height != g_av.geometry.base_height;
+
+   /* Video first: the frame belongs to the start of this tick's audio. */
+   if (pic.dupe && g_can_dupe && !resized)
+      video_cb(NULL, pic.width, pic.height, pic.pitch);
    else
-      video_cb(NULL, XS_IDLE_WIDTH, XS_IDLE_HEIGHT, XS_IDLE_WIDTH * sizeof(uint32_t));
-   output_audio();
+      video_cb(pic.data, pic.width, pic.height, pic.pitch);
+   if (n)
+      audio_batch_cb(g_audio, n);
+
+   /* The frontend's callbacks count too: they are what it does with us. */
+   last_end = av_gettime_relative();
+   g_ctx->run.run_sum_us += last_end - start;
+   if (last_end - start > g_ctx->run.run_max_us)
+      g_ctx->run.run_max_us = last_end - start;
+   g_ctx->run.runs++;
 }
 
 /* Live TV has nothing to restore (CLAUDE.md §5.12). */

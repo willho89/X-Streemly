@@ -7,5 +7,10 @@ SOURCES_C := \
 	$(CORE_DIR)/libretro.c \
 	$(CORE_DIR)/xs_source.c \
 	$(CORE_DIR)/xs_tuner.c \
+	$(CORE_DIR)/xs_pktq.c \
+	$(CORE_DIR)/xs_audio.c \
+	$(CORE_DIR)/xs_video.c \
+	$(CORE_DIR)/xs_present.c \
+	$(CORE_DIR)/xs_osd.c \
 	$(CORE_DIR)/xs_glibc_compat.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c

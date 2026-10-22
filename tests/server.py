@@ -18,6 +18,11 @@
 #   /_status/<code>/... answer with that HTTP status and no body
 #   /_stall/<ms>/...    send headers and half the body, wait, send the rest
 #   /_drop/...          send headers and half the body, then close
+#   /_hiccup/<n>/<ms>/... delay every n-th request under this prefix by ms
+#                       (a live stream that stalls now and then)
+#   /_gap/<n>/...       live.m3u8 skips one segment of content after every
+#                       n-th, numbering unchanged and no discontinuity tag:
+#                       a timestamp gap, as when segments expired unread
 import argparse
 import os
 import re
@@ -30,6 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WINDOW = 6
 START = time.monotonic()
+HICCUPS = {}
+HICCUP_LOCK = threading.Lock()
 
 TYPES = {
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -58,7 +65,7 @@ def parse_vod(path):
     return segs, target
 
 
-def live_playlist(vod_path):
+def live_playlist(vod_path, gap=0):
     segs, target = parse_vod(vod_path)
     n = len(segs)
     total = sum(d for d, _ in segs)
@@ -75,10 +82,13 @@ def live_playlist(vod_path):
     disc_seq = (first - 1) // n if first > 0 else 0
     out = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{target}",
            f"#EXT-X-MEDIA-SEQUENCE:{first}", f"#EXT-X-DISCONTINUITY-SEQUENCE:{disc_seq}"]
+    def content(a):   # which segment of the loop entry a plays
+        return a + (a // gap if gap else 0)
     for a in range(first, newest + 1):
-        if a > 0 and a % n == 0:
+        c = content(a)
+        if a > 0 and c // n != content(a - 1) // n:   # the loop wrapped
             out.append("#EXT-X-DISCONTINUITY")
-        d, uri = segs[a % n]
+        d, uri = segs[c % n]
         out.append(f"#EXTINF:{d:.6f},")
         out.append(uri)
     return ("\n".join(out) + "\n").encode()
@@ -103,7 +113,22 @@ class Handler(BaseHTTPRequestHandler):
     def handle_req(self, head):
         path = self.path.split("?", 1)[0]
         stall = drop = None
+        gap = 0
         while True:
+            g = re.match(r"^/_gap/(\d+)(/.*)$", path)
+            if g:
+                gap, path = int(g.group(1)), g.group(2)
+                continue
+            h = re.match(r"^/_hiccup/(\d+)/(\d+)(/.*)$", path)
+            if h:
+                every, ms, path = int(h.group(1)), int(h.group(2)), h.group(3)
+                with HICCUP_LOCK:
+                    n = HICCUPS.get((every, ms), 0) + 1
+                    HICCUPS[(every, ms)] = n
+                if n % every == 0:
+                    print(f"HICCUP {ms} ms on {path}", flush=True)
+                    time.sleep(ms / 1000)
+                continue
             m = re.match(r"^/_(delay|status|stall)/(\d+)(/.*)$", path) or re.match(r"^/_(drop)()(/.*)$", path)
             if not m:
                 break
@@ -130,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
             vod = os.path.join(os.path.dirname(full), "vod.m3u8")
             if not os.path.isfile(vod):
                 return self.fail(404)
-            body = live_playlist(vod)
+            body = live_playlist(vod, gap)
         elif os.path.isfile(full):
             with open(full, "rb") as f:
                 body = f.read()
