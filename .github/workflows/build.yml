@@ -126,7 +126,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends -o Acquire::Retries=3 pkg-config zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+          sudo apt-get install -y -q --no-install-recommends -o Acquire::Retries=3 pkg-config zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
+            libc6-dev-arm64-cross libc6-dev-armhf-cross
       - name: Dependency cache key
         id: deps
         run: echo "key=$(git submodule status | sha1sum | cut -c1-16)-${{ hashFiles('Makefile', 'Makefile.deps') }}" >> "$GITHUB_OUTPUT"

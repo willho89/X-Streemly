@@ -36,6 +36,7 @@ import argparse
 import os
 import re
 import socket
+import socketserver
 import ssl
 import sys
 import threading
@@ -238,6 +239,14 @@ class Handler(BaseHTTPRequestHandler):
         self.log_req(code)
 
 
+class Server(ThreadingHTTPServer):
+    # HTTPServer.server_bind looks up its own name (socket.getfqdn), which can
+    # take seconds on macOS; nothing here uses the name.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
@@ -246,7 +255,7 @@ def main():
     args = ap.parse_args()
 
     Handler.root = os.path.abspath(args.root)
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    srv = Server(("127.0.0.1", args.port), Handler)
     srv.daemon_threads = True
     if args.tls:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

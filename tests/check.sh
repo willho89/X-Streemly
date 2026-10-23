@@ -51,7 +51,7 @@ start_server() {
    PIDS="$PIDS $!"
    i=0
    while ! grep -q '^PORT ' "$out" 2>/dev/null; do
-      i=$((i + 1)); [ $i -gt 50 ] && { NAME=server; LOG=$out; fail "didn't start"; }
+      i=$((i + 1)); [ $i -gt 150 ] && { NAME=server; LOG=$out; fail "didn't start"; }
       sleep 0.1
    done
    eval "$var=$scheme://localhost:$(awk '/^PORT /{print $2; exit}' "$out")"

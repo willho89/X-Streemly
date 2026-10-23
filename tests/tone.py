@@ -19,8 +19,15 @@ while i + hop + win <= n:
     if max(abs(x) for x in left[i:i + hop]) < 300:
         i += hop
         continue
-    seg = left[i + hop // 2:i + hop // 2 + win]   # past the onset fade
+    while abs(left[i]) < 300:   # the beep's first loud sample
+        i += 1
+    seg = left[i + rate // 500:i + rate // 500 + win]   # past the onset fade
     rms = math.sqrt(sum(x * x for x in seg) / win)
-    zc = sum(1 for a, b in zip(seg, seg[1:]) if (a < 0) != (b < 0))
+    # Crossings with hysteresis, so low-level noise around zero adds none.
+    zc, sign = 0, 0
+    for x in seg:
+        s = 1 if x > 200 else -1 if x < -200 else sign
+        zc += sign != 0 and s != sign
+        sign = s
     print("%.2f %.0f %.1f" % (i / rate, zc / 2 / (win / rate), 20 * math.log10(rms / 32768 + 1e-12)))
     i += rate // 2
