@@ -16,5 +16,7 @@ SOURCES_C := \
 	$(CORE_DIR)/xs_chan.c \
 	$(CORE_DIR)/xs_input.c \
 	$(CORE_DIR)/xs_tv.c \
+	$(CORE_DIR)/xs_fetch.c \
+	$(CORE_DIR)/xs_iptv.c \
 	$(CORE_DIR)/xs_glibc_compat.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c

@@ -28,6 +28,8 @@ void xs_input_set_descriptors(retro_environment_t environ_cb)
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,      "Info / Tune" },
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,      "Last Channel / Close" },
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "Channel List" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,      "Favourite On/Off" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,      "Next Favourite" },
       { 0, 0, 0, 0, NULL },
    };
    environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void *)desc);
@@ -88,6 +90,8 @@ unsigned xs_input_poll(xs_input_t *in, retro_input_state_t state_cb, double fps,
       { RETRO_DEVICE_ID_JOYPAD_A,      XS_ACT_OK,         false },
       { RETRO_DEVICE_ID_JOYPAD_B,      XS_ACT_BACK,       false },
       { RETRO_DEVICE_ID_JOYPAD_SELECT, XS_ACT_LIST,       false },
+      { RETRO_DEVICE_ID_JOYPAD_X,      XS_ACT_FAV,        false },
+      { RETRO_DEVICE_ID_JOYPAD_Y,      XS_ACT_NEXT_FAV,   false },
    };
    uint32_t bits, keys;
    unsigned i, n = 0;

@@ -1,0 +1,15 @@
+#EXTM3U
+#EXTINF:-1 tvg-id="DeadNews.uk" tvg-logo="" group-title="News",Dead News (720p)
+@HTTPS@/_status/404/dead/index.m3u8
+#EXTINF:-1 tvg-id="FixtureNews.uk" tvg-logo="" group-title="News",Fixture News (1080p)
+@HTTPS@/hls2/master.m3u8
+#EXTINF:-1 tvg-id="GeoMovies.uk" tvg-logo="" group-title="Movies",Geo Movies (720p) [Geo-blocked]
+@HTTPS@/hls2/v720/live.m3u8
+#EXTINF:-1 tvg-id="FixtureSport.uk" tvg-logo="" group-title="Outdoor;Sports",Fixture Sport (1080i)
+@HTTPS@/hls_i1080/live.m3u8
+#EXTINF:-1 tvg-id="PartKids.uk" tvg-logo="" group-title="Animation;Kids",Part-time Kids (576i) [Not 24/7]
+@HTTP@/i576.ts
+#EXTINF:-1 tvg-id="FixtureNews.uk@Backup" tvg-logo="" group-title="News",Fixture News Backup
+@HTTPS@/hls2/master.m3u8
+#EXTINF:-1 tvg-id="FixtureMusic.uk" tvg-logo="" group-title="Music",Fixture Music (720p)
+@HTTPS@/hls2/v720/live.m3u8

@@ -24,6 +24,7 @@
 #define XS_DIGITS_MS       1500
 #define XS_MAX_DIGITS      4
 #define XS_SAVE_AFTER_MS   5000   /* write the last channel once it has settled */
+#define XS_AUTO_TRIES      20     /* dead channels skipped on our own at start */
 
 struct xs_tv
 {
@@ -46,6 +47,13 @@ struct xs_tv
    bool     list;
    unsigned cursor, top;
    uint64_t tuned_tick;
+   /* The last tune, watched until it shows a picture or fails before one:
+    * that decides the channel's dead mark (§5.8). */
+   bool     watching;
+   unsigned watch_gen, watch_idx;
+   /* The channel on was chosen by us (start, new lineup), not the viewer:
+    * if it's dead, move on to the next. Any button press ends this. */
+   unsigned auto_tries;
 
    xs_overlay_t ov;
 };
@@ -80,6 +88,20 @@ void xs_tv_free(xs_tv_t *tv)
    free(tv);
 }
 
+void xs_tv_set_lineup(xs_tv_t *tv, xs_chan_t *chan)
+{
+   xs_chan_save(tv->ctx, &tv->chan);
+   xs_chan_free(&tv->chan);
+   tv->chan = *chan;
+   memset(chan, 0, sizeof(*chan));
+   tv->have_pending = false;
+   tv->list         = false;
+   tv->digits[0]    = '\0';
+   tv->watching     = false;
+   tv->top = tv->cursor = 0;
+   xs_tv_start(tv);
+}
+
 static void note(xs_tv_t *tv, const char *msg)
 {
    snprintf(tv->note, sizeof(tv->note), "%s", msg);
@@ -104,13 +126,58 @@ static void tune(xs_tv_t *tv, unsigned idx)
    xs_chan_source(&tv->chan, idx, &src);
    xs_present_set_name(tv->present, e->name);
    XS_INFO(tv->ctx, "channel %u: %s\n", xs_chan_number(&tv->chan, idx), e->name);
-   xs_tuner_tune(tv->tuner, &src);
+   tv->watch_gen = xs_tuner_tune(tv->tuner, &src);
+   tv->watch_idx = idx;
+   tv->watching  = true;
 }
 
 void xs_tv_start(xs_tv_t *tv)
 {
-   tv->banner_idx = tv->chan.cur;
-   tune(tv, tv->chan.cur);
+   unsigned idx;
+   if (!xs_chan_count(&tv->chan))
+      return;
+   /* Start on a channel that isn't known to be dead. */
+   idx = xs_chan_is_dead(&tv->chan, tv->chan.cur) || (xs_chan_entry(&tv->chan, tv->chan.cur)->flags & XS_CH_DRM)
+       ? xs_chan_step(&tv->chan, tv->chan.cur, 1) : tv->chan.cur;
+   tv->auto_tries = XS_AUTO_TRIES;
+   tv->banner_idx = idx;
+   tune(tv, idx);
+}
+
+/* A tune that shows a picture clears the channel's dead mark; one that
+ * fails before any picture sets it, so channel up/down skips it for a day
+ * (it stays in the list and reachable by number). */
+static void watch_tune(xs_tv_t *tv)
+{
+   xs_tuner_status_t st;
+   if (!tv->watching)
+      return;
+   xs_tuner_get_status(tv->tuner, &st);
+   if (st.gen != tv->watch_gen)
+      return;
+   if (xs_present_has_picture(tv->present) || (st.state == XS_TUNER_PLAYING && !st.has_video && st.packets))
+   {
+      if (xs_chan_is_dead(&tv->chan, tv->watch_idx))
+         XS_INFO(tv->ctx, "channel %u works again\n", xs_chan_number(&tv->chan, tv->watch_idx));
+      xs_chan_mark_dead(&tv->chan, tv->watch_idx, false);
+      tv->watching = false;
+   }
+   else if (st.state == XS_TUNER_FAILED && !st.packets)
+   {
+      XS_INFO(tv->ctx, "channel %u is dead (%s): skipped for a day\n",
+              xs_chan_number(&tv->chan, tv->watch_idx), st.msg);
+      xs_chan_mark_dead(&tv->chan, tv->watch_idx, true);
+      tv->watching = false;
+      if (tv->auto_tries && xs_chan_count(&tv->chan) > 1)
+      {
+         unsigned next = xs_chan_step(&tv->chan, tv->watch_idx, 1);
+         tv->auto_tries--;
+         if (next != tv->watch_idx)
+            tune(tv, next);
+      }
+   }
+   else if (xs_present_has_picture(tv->present))
+      tv->auto_tries = 0;
 }
 
 static void move_pending(xs_tv_t *tv, unsigned idx)
@@ -147,6 +214,9 @@ static void list_move(xs_tv_t *tv, int by)
 static void handle(xs_tv_t *tv, unsigned act, unsigned rows)
 {
    unsigned base = tv->have_pending ? tv->pending : tv->chan.cur;
+
+   if (!xs_chan_count(&tv->chan))
+      return;   /* still loading */
 
    if (tv->list)
    {
@@ -204,6 +274,21 @@ static void handle(xs_tv_t *tv, unsigned act, unsigned rows)
          if (tv->digits[0])
             commit_digits(tv);
          break;
+      case XS_ACT_FAV:
+         xs_chan_toggle_fav(&tv->chan, tv->chan.cur);
+         note(tv, xs_chan_is_fav(&tv->chan, tv->chan.cur) ? "* ADDED TO FAVOURITES" : "REMOVED FROM FAVOURITES");
+         tv->banner_idx   = tv->chan.cur;
+         tv->banner_until = after_ms(tv, XS_NOTE_MS);
+         break;
+      case XS_ACT_NEXT_FAV:
+      {
+         unsigned f = xs_chan_next_fav(&tv->chan, base);
+         if (f == base && !xs_chan_is_fav(&tv->chan, base))
+            note(tv, "NO FAVOURITES YET: X ADDS ONE");
+         else
+            move_pending(tv, f);
+         break;
+      }
       default: break;
    }
 }
@@ -224,12 +309,22 @@ static void build_overlay(xs_tv_t *tv, unsigned pic_h)
 {
    xs_overlay_t ov;
    unsigned shown = tv->banner_idx;
-   const xs_entry_t *e = xs_chan_entry(&tv->chan, shown);
+   const xs_entry_t *e;
    /* The tuning / no-signal card already names the channel. */
    bool card = xs_present_card_showing(tv->present);
 
    memset(&ov, 0, sizeof(ov));
    ov.list_sel = ov.list_on = -1;
+   if (!xs_chan_count(&tv->chan))
+   {
+      if (memcmp(&ov, &tv->ov, sizeof(ov)))
+      {
+         ov.version = tv->ov.version + 1;
+         tv->ov = ov;
+      }
+      return;
+   }
+   e = xs_chan_entry(&tv->chan, shown);
 
    if (tv->digits[0])
    {
@@ -239,7 +334,8 @@ static void build_overlay(xs_tv_t *tv, unsigned pic_h)
    else if (tv->ticks < tv->banner_until || tv->have_pending)
    {
       ov.banner = true;
-      snprintf(ov.number, sizeof(ov.number), "%u", xs_chan_number(&tv->chan, shown));
+      snprintf(ov.number, sizeof(ov.number), "%s%u", xs_chan_is_fav(&tv->chan, shown) ? "*" : "",
+               xs_chan_number(&tv->chan, shown));
       if (!card || shown != tv->chan.cur)
       {
          snprintf(ov.name, sizeof(ov.name), "%s", e->name);
@@ -287,7 +383,9 @@ static void build_overlay(xs_tv_t *tv, unsigned pic_h)
       {
          unsigned idx = tv->top + i;
          const xs_entry_t *r = xs_chan_entry(&tv->chan, idx);
-         snprintf(ov.list_row[i], sizeof(ov.list_row[i]), "%4u  %.140s", xs_chan_number(&tv->chan, idx), r->name);
+         snprintf(ov.list_row[i], sizeof(ov.list_row[i]), "%4u %c %.130s%s", xs_chan_number(&tv->chan, idx),
+                  xs_chan_is_fav(&tv->chan, idx) ? '*' : ' ', r->name,
+                  xs_chan_is_dead(&tv->chan, idx) ? "  (NO SIGNAL)" : "");
          if (idx == tv->cursor)
             ov.list_sel = (int)i;
          if (idx == tv->chan.cur)
@@ -312,7 +410,10 @@ void xs_tv_tick(xs_tv_t *tv, retro_input_state_t input_cb, double fps, unsigned 
 
    tv->ticks++;
    tv->fps = fps;
+   watch_tune(tv);
    n = xs_input_poll(&tv->in, input_cb, fps, acts, &zapping);
+   if (n)
+      tv->auto_tries = 0;   /* the viewer is choosing now */
    for (i = 0; i < n; i++)
       handle(tv, acts[i], rows);
 
@@ -325,7 +426,8 @@ void xs_tv_tick(xs_tv_t *tv, retro_input_state_t input_cb, double fps, unsigned 
    }
    if (tv->digits[0] && tv->ticks >= tv->digits_tick + (uint64_t)(XS_DIGITS_MS * fps / 1000.0))
       commit_digits(tv);
-   if (tv->chan.dirty && tv->ticks >= tv->tuned_tick + (uint64_t)(XS_SAVE_AFTER_MS * fps / 1000.0))
+   if ((tv->chan.dirty || tv->chan.dead.dirty || tv->chan.favs.dirty) &&
+       tv->ticks >= tv->tuned_tick + (uint64_t)(XS_SAVE_AFTER_MS * fps / 1000.0))
       xs_chan_save(tv->ctx, &tv->chan);
 
    build_overlay(tv, pic_h);

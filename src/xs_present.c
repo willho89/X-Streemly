@@ -55,6 +55,7 @@ struct xs_present
    xs_ctx_t   *ctx;
    xs_tuner_t *tuner;
    char        name[256];
+   char        idle_title[64], idle_detail[256];
 
    unsigned  gen, serial;
    unsigned  gen_seen;        /* the tune timed by tune_us */
@@ -99,6 +100,7 @@ xs_present_t *xs_present_new(xs_ctx_t *ctx, xs_tuner_t *tuner)
    p->ctx   = ctx;
    p->tuner = tuner;
    p->ratio = 1.0;
+   xs_present_set_idle(p, "NO CONTENT", "LOAD A PLAYLIST OR A .STRM FILE");
    return p;
 }
 
@@ -283,6 +285,17 @@ static bool controller(xs_present_t *p, double fps, int64_t level_us)
    return false;
 }
 
+void xs_present_set_idle(xs_present_t *p, const char *title, const char *detail)
+{
+   snprintf(p->idle_title, sizeof(p->idle_title), "%s", title ? title : "");
+   snprintf(p->idle_detail, sizeof(p->idle_detail), "%s", detail ? detail : "");
+}
+
+bool xs_present_has_picture(const xs_present_t *p)
+{
+   return p->pictured && p->gen_seen == p->gen;
+}
+
 bool xs_present_card_showing(const xs_present_t *p)
 {
    return p->card_on_screen;
@@ -371,7 +384,7 @@ void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frame
    {
       switch (st.state)
       {
-         case XS_TUNER_IDLE:   card(p, "NO CONTENT", "LOAD A .STRM FILE", pic); break;
+         case XS_TUNER_IDLE:   card(p, p->idle_title, p->idle_detail, pic); break;
          case XS_TUNER_FAILED: card(p, "NO SIGNAL", reason(st.msg), pic); break;
          case XS_TUNER_ENDED:  card(p, "END OF STREAM", NULL, pic); break;
          default:              card(p, "TUNING", NULL, pic); break;

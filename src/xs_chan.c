@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "xs_chan.h"
 
@@ -94,40 +95,118 @@ static void save_state(xs_ctx_t *ctx, const xs_chan_t *c)
    fclose(f);
 }
 
-bool xs_chan_load(xs_ctx_t *ctx, xs_chan_t *c, const char *content, const char *save_dir,
-                  char *err, size_t errlen)
+/* ---- marks ------------------------------------------------------------ */
+
+static unsigned long long entry_key(const xs_entry_t *e)
+{
+   return lineup_hash(e->tvg_id[0] ? e->tvg_id : e->url);
+}
+
+static void marks_load(xs_marks_t *m, const char *dir, const char *name)
+{
+   FILE *f;
+   char line[64];
+   memset(m, 0, sizeof(*m));
+   if (!dir || !dir[0])
+      return;
+   snprintf(m->path, sizeof(m->path), "%.4000s/%s", dir, name);
+   if (!(f = fopen(m->path, "r")))
+      return;
+   while (fgets(line, sizeof(line), f))
+   {
+      unsigned long long k;
+      long long t;
+      if (sscanf(line, "%llx %lld", &k, &t) != 2)
+         continue;
+      if (m->n == m->cap)
+      {
+         unsigned cap = m->cap ? m->cap * 2 : 64;
+         unsigned long long *nk = realloc(m->key, cap * sizeof(*nk));
+         long long *nt = nk ? realloc(m->when, cap * sizeof(*nt)) : NULL;
+         if (nk)
+            m->key = nk;
+         if (!nk || !nt)
+            break;
+         m->when = nt;
+         m->cap  = cap;
+      }
+      m->key[m->n]  = k;
+      m->when[m->n] = t;
+      m->n++;
+   }
+   fclose(f);
+}
+
+static void marks_save(xs_ctx_t *ctx, xs_marks_t *m)
+{
+   FILE *f;
+   unsigned i;
+   if (!m->dirty || !m->path[0])
+      return;
+   m->dirty = false;
+   if (!(f = fopen(m->path, "w")))
+   {
+      XS_WARN(ctx, "can't write %s: %s\n", m->path, strerror(errno));
+      return;
+   }
+   for (i = 0; i < m->n; i++)
+      fprintf(f, "%016llx %lld\n", m->key[i], m->when[i]);
+   fclose(f);
+}
+
+static int marks_find(const xs_marks_t *m, unsigned long long k)
 {
    unsigned i;
+   for (i = 0; i < m->n; i++)
+      if (m->key[i] == k)
+         return (int)i;
+   return -1;
+}
 
-   memset(c, 0, sizeof(*c));
-   if (has_ext(content, "m3u") || has_ext(content, "m3u8"))
+static void marks_set(xs_marks_t *m, unsigned long long k, bool on)
+{
+   int i = marks_find(m, k);
+   if (on)
    {
-      if (!xs_playlist_load(content, &c->pl, err, errlen))
-         return false;
+      if (i < 0)
+      {
+         if (m->n == m->cap)
+         {
+            unsigned cap = m->cap ? m->cap * 2 : 64;
+            unsigned long long *nk = realloc(m->key, cap * sizeof(*nk));
+            long long *nt = nk ? realloc(m->when, cap * sizeof(*nt)) : NULL;
+            if (nk)
+               m->key = nk;
+            if (!nk || !nt)
+               return;
+            m->when = nt;
+            m->cap  = cap;
+         }
+         i = (int)m->n++;
+         m->key[i] = k;
+      }
+      m->when[i] = (long long)time(NULL);
    }
-   else
+   else if (i >= 0)
    {
-      /* .strm or a URL: one channel */
-      xs_source_t src;
-      if (!xs_source_from_content(ctx, content, &src, err, errlen))
-         return false;
-      c->pl.e = calloc(1, sizeof(*c->pl.e));
-      if (!c->pl.e)
-         return false;
-      c->pl.n = c->pl.cap = 1;
-      c->pl.e[0].chno = -1;
-      snprintf(c->pl.e[0].name, sizeof(c->pl.e[0].name), "%s", src.name);
-      snprintf(c->pl.e[0].url, sizeof(c->pl.e[0].url), "%s", src.url);
-      c->pl.e[0].local = src.local;
+      m->key[i]  = m->key[m->n - 1];
+      m->when[i] = m->when[m->n - 1];
+      m->n--;
    }
-   c->number = calloc(c->pl.n, sizeof(*c->number));
-   if (!c->number)
-   {
-      xs_playlist_free(&c->pl);
-      return false;
-   }
+   m->dirty = true;
+}
+
+static void marks_free(xs_marks_t *m)
+{
+   free(m->key);
+   free(m->when);
+   memset(m, 0, sizeof(*m));
+}
+
+static void finish(xs_ctx_t *ctx, xs_chan_t *c, const char *key, const char *save_dir)
+{
+   unsigned i;
    number_channels(c);
-
    XS_INFO(ctx, "lineup: %u channel(s)%s\n", c->pl.n, c->pl.hls ? " (an HLS playlist)" : "");
    for (i = 0; i < c->pl.n; i++)
    {
@@ -140,22 +219,75 @@ bool xs_chan_load(xs_ctx_t *ctx, xs_chan_t *c, const char *content, const char *
                e->user_agent[0] ? " ua " : "", e->user_agent,
                e->referrer[0] ? " referrer " : "", e->referrer);
    }
-
    if (save_dir && save_dir[0])
    {
       char dir[4096];
       snprintf(dir, sizeof(dir), "%.4000s/X-Streemly", save_dir);
       mkdir(dir, 0755);
-      snprintf(c->state_path, sizeof(c->state_path), "%.4000s/%016llx.state", dir, lineup_hash(content));
+      snprintf(c->state_path, sizeof(c->state_path), "%.4000s/%016llx.state", dir, lineup_hash(key));
+      marks_load(&c->dead, dir, "dead.txt");
+      marks_load(&c->favs, dir, "favourites.txt");
    }
    load_state(ctx, c);
+}
+
+bool xs_chan_from_playlist(xs_ctx_t *ctx, xs_chan_t *c, xs_playlist_t *pl, const char *key,
+                           const char *save_dir)
+{
+   memset(c, 0, sizeof(*c));
+   c->pl = *pl;
+   memset(pl, 0, sizeof(*pl));
+   c->number = calloc(c->pl.n ? c->pl.n : 1, sizeof(*c->number));
+   if (!c->number)
+   {
+      xs_playlist_free(&c->pl);
+      return false;
+   }
+   finish(ctx, c, key, save_dir);
    return true;
+}
+
+void xs_chan_empty(xs_chan_t *c)
+{
+   memset(c, 0, sizeof(*c));
+}
+
+bool xs_chan_load(xs_ctx_t *ctx, xs_chan_t *c, const char *content, const char *save_dir,
+                  char *err, size_t errlen)
+{
+   xs_playlist_t pl;
+
+   memset(c, 0, sizeof(*c));
+   memset(&pl, 0, sizeof(pl));
+   if (has_ext(content, "m3u") || has_ext(content, "m3u8"))
+   {
+      if (!xs_playlist_load(content, &pl, err, errlen))
+         return false;
+   }
+   else
+   {
+      /* .strm or a URL: one channel */
+      xs_source_t src;
+      if (!xs_source_from_content(ctx, content, &src, err, errlen))
+         return false;
+      pl.e = calloc(1, sizeof(*pl.e));
+      if (!pl.e)
+         return false;
+      pl.n = pl.cap = 1;
+      pl.e[0].chno = -1;
+      snprintf(pl.e[0].name, sizeof(pl.e[0].name), "%s", src.name);
+      snprintf(pl.e[0].url, sizeof(pl.e[0].url), "%s", src.url);
+      pl.e[0].local = src.local;
+   }
+   return xs_chan_from_playlist(ctx, c, &pl, content, save_dir);
 }
 
 void xs_chan_free(xs_chan_t *c)
 {
    xs_playlist_free(&c->pl);
    free(c->number);
+   marks_free(&c->dead);
+   marks_free(&c->favs);
    memset(c, 0, sizeof(*c));
 }
 
@@ -176,19 +308,26 @@ unsigned xs_chan_number(const xs_chan_t *c, unsigned idx)
 
 unsigned xs_chan_step(const xs_chan_t *c, unsigned idx, int dir)
 {
-   unsigned i, n = c->pl.n;
-   for (i = 1; i <= n; i++)
-   {
-      unsigned j = (unsigned)(((int)idx + dir * (int)i) % (int)n + (int)n) % n;
-      if (!(c->pl.e[j].flags & XS_CH_DRM))
-         return j;
-   }
+   unsigned i, n = c->pl.n, pass;
+   if (!n)
+      return idx;
+   /* First pass skips dead channels too; if every channel is dead, the
+    * second doesn't. */
+   for (pass = 0; pass < 2; pass++)
+      for (i = 1; i <= n; i++)
+      {
+         unsigned j = (unsigned)(((int)idx + dir * (int)i) % (int)n + (int)n) % n;
+         if (!(c->pl.e[j].flags & XS_CH_DRM) && (pass || !xs_chan_is_dead(c, j)))
+            return j;
+      }
    return idx;
 }
 
 unsigned xs_chan_group_step(const xs_chan_t *c, unsigned idx, int dir)
 {
    unsigned i, n = c->pl.n;
+   if (!n)
+      return idx;
    const char *g = c->pl.e[idx].group;
    for (i = 1; i < n; i++)
    {
@@ -226,6 +365,42 @@ unsigned xs_chan_max_number(const xs_chan_t *c)
    return m;
 }
 
+void xs_chan_mark_dead(xs_chan_t *c, unsigned idx, bool dead)
+{
+   unsigned long long k = entry_key(&c->pl.e[idx]);
+   if (dead || marks_find(&c->dead, k) >= 0)
+      marks_set(&c->dead, k, dead);
+}
+
+bool xs_chan_is_dead(const xs_chan_t *c, unsigned idx)
+{
+   int i = marks_find(&c->dead, entry_key(&c->pl.e[idx]));
+   return i >= 0 && (long long)time(NULL) - c->dead.when[i] < XS_DEAD_SECONDS;
+}
+
+void xs_chan_toggle_fav(xs_chan_t *c, unsigned idx)
+{
+   unsigned long long k = entry_key(&c->pl.e[idx]);
+   marks_set(&c->favs, k, marks_find(&c->favs, k) < 0);
+}
+
+bool xs_chan_is_fav(const xs_chan_t *c, unsigned idx)
+{
+   return marks_find(&c->favs, entry_key(&c->pl.e[idx])) >= 0;
+}
+
+unsigned xs_chan_next_fav(const xs_chan_t *c, unsigned idx)
+{
+   unsigned i, n = c->pl.n;
+   for (i = 1; i <= n; i++)
+   {
+      unsigned j = (idx + i) % n;
+      if (xs_chan_is_fav(c, j))
+         return j;
+   }
+   return idx;
+}
+
 void xs_chan_set(xs_ctx_t *ctx, xs_chan_t *c, unsigned idx)
 {
    if (idx != c->cur)
@@ -239,6 +414,8 @@ void xs_chan_set(xs_ctx_t *ctx, xs_chan_t *c, unsigned idx)
 
 void xs_chan_save(xs_ctx_t *ctx, xs_chan_t *c)
 {
+   marks_save(ctx, &c->dead);
+   marks_save(ctx, &c->favs);
    if (!c->dirty)
       return;
    c->dirty = false;

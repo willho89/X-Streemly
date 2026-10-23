@@ -292,6 +292,77 @@ expect 'channel 5: SD Movies'
 expect 'channel 1: Fixture News'
 ok "the last channel (5) and the one before (1) survive a restart"
 
+echo "== M3: iptv-org (a fake one on the test server) and lists at a URL"
+
+IPTV=$FIX/iptv-fake
+mkdir -p "$IPTV/countries" "$IPTV/languages"
+sed -e "s|@HTTPS@|$HTTPS|" -e "s|@HTTP@|$HTTP|" tests/fixtures/iptv_uk.m3u.in > "$IPTV/countries/uk.m3u"
+sed -e "s|@HTTPS@|$HTTPS|" -e "s|@HTTP@|$HTTP|" tests/fixtures/iptv_eng.m3u.in > "$IPTV/languages/eng.m3u"
+FAKE="XSTREEMLY_IPTV_BASE=$HTTPS/iptv-fake/ XSTREEMLY_CA_FILE=$FIX/tls/cert.pem"
+fresh_lineup
+
+run iptv_start - 900 $FAKE
+expect 'iptv-org: downloaded countries/uk.m3u'
+expect 'iptv-org: 5 channels \(hidden: 1 geo-blocked, 0 not 24/7, 0 other filters, 1 duplicates\)'
+expect 'channel 1 is dead'
+expect 'channel 2: Fixture News'
+expect 'picture .* after tune'
+check_common
+ok "no content: 5 channels (geo-blocked and a duplicate hidden), dead channel 1 skipped on its own"
+
+run iptv_cache - 120 $FAKE
+expect 'countries/uk.m3u from the cache'
+expect_no 'channel 1: Dead News'
+ok "cached list; starts past the channel known to be dead"
+
+run iptv_offline - 600 XSTREEMLY_IPTV_BASE=https://127.0.0.1:1/ HARNESS_OPT_xstreemly_refresh=0
+expect 'using the cached list'
+expect 'picture .* after tune'
+ok "offline: the cached list, however old"
+
+run iptv_down - 400 $FAKE HARNESS_INPUT="150:DOWN"
+expect 'channel 5: Fixture Music'
+expect_no 'channel 1: Dead News'
+ok "Down from channel 2 wraps to 5, skipping dead channel 1"
+
+# Starts on channel 5 (where the last run left it): X marks it, Up goes on
+# (skipping dead 1) to 2, Y comes back to the favourite.
+run iptv_favs - 700 $FAKE HARNESS_INPUT="150:X,200:UP,500:Y"
+expect 'lineup: back on channel 5'
+expect 'channel 2: Fixture News'
+[ "$(grep -c 'channel 5: Fixture Music' "$LOG")" -eq 2 ] || fail "Y didn't go back to the favourite"
+[ -s "$WORK/X-Streemly/favourites.txt" ] || fail "favourites not saved"
+ok "X marks a favourite (saved), Y goes back to it"
+
+fresh_lineup
+run iptv_verify - 120 XSTREEMLY_IPTV_BASE=$HTTPS/iptv-fake/
+expect 'lineup: countries/uk.m3u: '
+expect 'OSD: Channel list: '
+ok "TLS is checked: the self-signed test server is refused without its certificate"
+
+fresh_lineup
+run iptv_category - 300 $FAKE HARNESS_OPT_xstreemly_category=Sports
+expect 'iptv-org: 1 channels'
+expect 'channel 1: Fixture Sport'
+ok "Category Sports: only Outdoor;Sports matches"
+
+fresh_lineup
+run iptv_language - 300 $FAKE HARNESS_OPT_xstreemly_language=eng
+expect 'iptv-org: 2 channels'
+expect 'channel 1: Fixture News'
+ok "Language English: the country's channels that are in the language list"
+
+fresh_lineup
+run iptv_not247 - 120 $FAKE HARNESS_OPT_xstreemly_hide_not_247=on
+expect 'iptv-org: 4 channels \(hidden: 1 geo-blocked, 1 not 24/7'
+ok "Hide part-time channels"
+
+fresh_lineup
+run remote_list "$HTTPS/iptv-fake/countries/uk.m3u" 300
+expect 'channel list .*: 7 channel'
+expect 'lineup: 7 channel'
+ok "a .strm naming a channel list loads it (unfiltered, as the user's own)"
+
 echo "== failures never block the frontend"
 
 run http_404 "$HTTPS/_status/404/hls2/master.m3u8" 60
@@ -305,9 +376,11 @@ expect_no 'opened in'
 check_common
 ok "unload while connecting: $(awk '/^unload_ms/{print $2}' "$LOG") ms"
 
-run no_content - 30
-expect 'OSD: No content'
+fresh_lineup
+run no_content - 120 XSTREEMLY_IPTV_BASE=https://127.0.0.1:1/
+expect 'lineup: countries/uk.m3u: '
+expect 'OSD: Channel list: '
 check_common
-ok "no content"
+ok "no content and iptv-org unreachable (no cache): NO CHANNELS card, nothing blocks"
 
 echo "== all checks passed"

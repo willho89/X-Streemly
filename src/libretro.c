@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <math.h>
 
@@ -26,6 +27,8 @@
 #include "xs_chan.h"
 #include "xs_ctx.h"
 #include "xs_input.h"
+#include "xs_iptv.h"
+#include "xs_iptv_tables.h"
 #include "xs_osd.h"
 #include "xs_present.h"
 #include "xs_tuner.h"
@@ -54,6 +57,15 @@ static double     g_fps = XS_DEFAULT_FPS;
 static double     g_audio_accum;
 static xs_present_t *g_present;
 static xs_tv_t      *g_tv;
+
+/* Lineups that are downloaded (§5.7, §5.8): iptv-org with no content, or a
+ * channel list at a URL from a .strm. */
+static xs_iptv_t      *g_iptv;
+static bool            g_iptv_lineup;     /* the iptv-org lineup is in use */
+static bool            g_lineup_pending;  /* a request is running */
+static xs_iptv_query_t g_query;           /* what the iptv-org lineup is for */
+static char            g_lineup_key[4200];
+static char            g_save_dir[4096];
 
 /* The TV's overlay is drawn straight onto the picture on screen (a frame
  * slot or the presenter's card: memory only this thread touches while it
@@ -176,6 +188,7 @@ static void show_message(unsigned ms, bool alert, const char *fmt, ...)
 /* ---- core options --------------------------------------------------------- */
 
 static struct retro_core_option_v2_category g_opt_categories[] = {
+   { "iptv", "Channels", "The free iptv-org channels, used when the core starts without content." },
    { "video", "Video", "Resolution and deinterlacing." },
    { "advanced", "Advanced", "Buffering and logging." },
    { NULL, NULL, NULL },
@@ -206,6 +219,49 @@ static struct retro_core_option_v2_definition g_opt_defs[] = {
       NULL, "video",
       { { "on", "On" }, { "off", "Off" }, { NULL, NULL } },
       "on"
+   },
+   {
+      "xstreemly_country", "Country", NULL,
+      "Whose channels to show when the core starts without content (iptv-org's free, "
+      "public lists). Countries with fewer channels are in 'All countries'.",
+      NULL, "iptv",
+      { XS_IPTV_COUNTRY_VALUES },
+      "uk"
+   },
+   {
+      "xstreemly_category", "Category", NULL,
+      "Only channels of this kind.",
+      NULL, "iptv",
+      { XS_IPTV_CATEGORY_VALUES },
+      "all"
+   },
+   {
+      "xstreemly_language", "Language", NULL,
+      "Only channels in this language.",
+      NULL, "iptv",
+      { XS_IPTV_LANGUAGE_VALUES },
+      "any"
+   },
+   {
+      "xstreemly_hide_geoblocked", "Hide Geo-blocked Channels", NULL,
+      "Leave out channels marked as only watchable in their own country.",
+      NULL, "iptv",
+      { { "on", "On" }, { "off", "Off" }, { NULL, NULL } },
+      "on"
+   },
+   {
+      "xstreemly_hide_not_247", "Hide Part-time Channels", NULL,
+      "Leave out channels marked as not on the air 24/7.",
+      NULL, "iptv",
+      { { "off", "Off" }, { "on", "On" }, { NULL, NULL } },
+      "off"
+   },
+   {
+      "xstreemly_refresh", "Refresh Channel Lists", NULL,
+      "How often to download the channel lists again. Cached lists are used without a network.",
+      NULL, "iptv",
+      { { "24", "Daily" }, { "168", "Weekly" }, { "0", "Every start" }, { NULL, NULL } },
+      "24"
    },
    {
       "xstreemly_buffer", "Buffer", NULL,
@@ -287,6 +343,93 @@ static void read_options(xs_ctx_t *ctx)
    {
       xs_tuner_set_max_height(ctx->tuner, ctx->opt.max_height);
       xs_video_set_options(xs_tuner_video(ctx->tuner), ctx->opt.deint, ctx->opt.max_height);
+   }
+}
+
+static void read_query(xs_iptv_query_t *q)
+{
+   const char *v;
+   memset(q, 0, sizeof(*q));
+   v = get_option("xstreemly_country");
+   snprintf(q->country, sizeof(q->country), "%s", v ? v : "uk");
+   v = get_option("xstreemly_language");
+   snprintf(q->language, sizeof(q->language), "%s", v ? v : "any");
+   v = get_option("xstreemly_category");
+   snprintf(q->category, sizeof(q->category), "%s", v ? v : "all");
+   v = get_option("xstreemly_hide_geoblocked");
+   q->hide_geoblocked = !v || strcmp(v, "off");
+   v = get_option("xstreemly_hide_not_247");
+   q->hide_not_247 = v && !strcmp(v, "on");
+   v = get_option("xstreemly_refresh");
+   q->refresh_hours = v ? (unsigned)atoi(v) : 24;
+}
+
+/* Ask for the iptv-org lineup the options describe. */
+static void request_iptv(void)
+{
+   char what[256];
+   read_query(&g_query);
+   xs_iptv_key(&g_query, g_lineup_key, sizeof(g_lineup_key));
+   xs_iptv_describe(&g_query, what, sizeof(what));
+   XS_INFO(g_ctx, "lineup: %s\n", what);
+   xs_iptv_request(g_iptv, &g_query);
+   g_iptv_lineup    = true;
+   g_lineup_pending = true;
+}
+
+/* A .strm whose URL is a channel list rather than a stream (§5.7): an .m3u
+ * path, or an IPTV panel's "type=m3u" link. .m3u8 is left to the tuner:
+ * it's HLS far more often than a channel list. */
+static bool is_list_url(const char *url)
+{
+   size_t n = strcspn(url, "?#");
+   return (strstr(url, "://") && n >= 4 && !strncasecmp(url + n - 4, ".m3u", 4)) ||
+          strstr(url, "type=m3u");
+}
+
+/* While a lineup downloads, the idle card says so; take it when it's
+ * ready. Also rebuild the iptv-org lineup when its options change. */
+static void update_lineup(bool options_changed)
+{
+   xs_playlist_t pl;
+   char msg[256], what[256];
+   int r;
+
+   if (options_changed && g_iptv_lineup)
+   {
+      xs_iptv_query_t q;
+      read_query(&q);
+      if (memcmp(&q, &g_query, sizeof(q)))
+         request_iptv();
+   }
+   if (!g_lineup_pending)
+      return;
+   r = xs_iptv_poll(g_iptv, &pl, msg, sizeof(msg));
+   if (g_iptv_lineup)
+      xs_iptv_describe(&g_query, what, sizeof(what));
+   else
+      snprintf(what, sizeof(what), "CHANNEL LIST");
+   if (r == 0)
+   {
+      char detail[512];
+      snprintf(detail, sizeof(detail), "%s: %s", what, msg);
+      xs_present_set_idle(g_present, "LOADING CHANNELS", detail);
+   }
+   else if (r < 0)
+   {
+      g_lineup_pending = false;
+      xs_present_set_idle(g_present, "NO CHANNELS", msg);
+      show_message(8000, true, "Channel list: %s", msg);
+   }
+   else
+   {
+      xs_chan_t chan;
+      g_lineup_pending = false;
+      if (xs_chan_from_playlist(g_ctx, &chan, &pl, g_lineup_key, g_save_dir))
+      {
+         show_message(4000, false, "%s: %u channels", what, xs_chan_count(&chan));
+         xs_tv_set_lineup(g_tv, &chan);
+      }
    }
 }
 
@@ -407,16 +550,41 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    g_saved_pix   = NULL;
    g_pic_h       = 0;
 
-   memset(&chan, 0, sizeof(chan));
+   g_iptv_lineup    = false;
+   g_lineup_pending = false;
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir) || !save_dir)
+      save_dir = "";
+   snprintf(g_save_dir, sizeof(g_save_dir), "%s", save_dir);
+
+   /* What the lineup comes from: a local list or .strm now; a list at a URL
+    * or iptv-org later, from the lineup thread (the TV starts empty). */
+   xs_chan_empty(&chan);
    if (game && game->path)
    {
-      if (!environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir))
-         save_dir = NULL;
-      if (!xs_chan_load(g_ctx, &chan, game->path, save_dir, err, sizeof(err)))
+      xs_source_t src;
+      bool remote = xs_source_from_content(g_ctx, game->path, &src, err, sizeof(err)) &&
+                    is_list_url(src.url);
+      if (remote)
+         snprintf(g_lineup_key, sizeof(g_lineup_key), "%s", src.url);
+      else if (!xs_chan_load(g_ctx, &chan, game->path, save_dir, err, sizeof(err)))
       {
          XS_ERROR(g_ctx, "%s\n", err);
          return false;
       }
+      g_lineup_pending = remote;
+      if (remote)
+      {
+         g_iptv = xs_iptv_new(g_ctx, save_dir);
+         if (!g_iptv)
+            return false;
+         xs_iptv_request_url(g_iptv, src.url, src.user_agent, src.referrer);
+      }
+   }
+   else
+   {
+      g_iptv = xs_iptv_new(g_ctx, save_dir);
+      if (!g_iptv)
+         return false;
    }
 
    g_ctx->tuner = xs_tuner_new(g_ctx);
@@ -434,12 +602,11 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
       return false;
    }
    read_options(g_ctx);   /* again, now that the tuner exists */
-
    if (!game || !game->path)
-   {
-      show_message(6000, false, "No content: load a playlist or a .strm file");
-      return true;
-   }
+      request_iptv();   /* no content: iptv-org (D-006) */
+   if (g_lineup_pending)
+      xs_present_set_idle(g_present, "LOADING CHANNELS", "");
+
    /* Room for the overlay at the declared maximum, touched now so opening
     * the channel list never page-faults 8 MB in one tick. */
    g_panels_cap = (size_t)XS_MAX_WIDTH * XS_MAX_HEIGHT * sizeof(uint32_t);
@@ -475,6 +642,8 @@ RETRO_API void retro_unload_game(void)
 {
    xs_tv_free(g_tv);
    g_tv = NULL;
+   xs_iptv_free(g_iptv);
+   g_iptv = NULL;
    if (g_present)
    {
       xs_present_log_stats(g_present);
@@ -673,6 +842,8 @@ RETRO_API void retro_run(void)
    input_poll_cb();
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       read_options(g_ctx);
+   if (g_iptv && g_tv)
+      update_lineup(updated);
    if (g_tv)
       xs_tv_tick(g_tv, input_state_cb, g_fps, g_pic_h);
    update_osd();

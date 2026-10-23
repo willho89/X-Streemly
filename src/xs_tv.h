@@ -23,7 +23,11 @@ xs_tv_t *xs_tv_new(xs_ctx_t *ctx, xs_tuner_t *tuner, xs_present_t *present, xs_c
                    bool bitmasks);
 void xs_tv_free(xs_tv_t *tv);
 
-/* Tune the lineup's current channel (load, reset). */
+/* Replace the lineup (taken over) and tune its current channel: a lineup
+ * that had to be downloaded, or one rebuilt after the options changed. */
+void xs_tv_set_lineup(xs_tv_t *tv, xs_chan_t *chan);
+
+/* Tune the lineup's current channel (load, reset); nothing if it's empty. */
 void xs_tv_start(xs_tv_t *tv);
 
 /* One tick: read input, change channel, update the overlay. pic_h is the

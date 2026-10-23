@@ -1,0 +1,5 @@
+#EXTM3U
+#EXTINF:-1 tvg-id="FixtureNews.uk" group-title="English",Fixture News (1080p)
+@HTTPS@/hls2/master.m3u8
+#EXTINF:-1 tvg-id="FixtureSport.uk" group-title="English",Fixture Sport (1080i)
+@HTTPS@/hls_i1080/live.m3u8

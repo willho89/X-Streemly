@@ -25,6 +25,8 @@ typedef enum
    XS_ACT_BACK,         /* B: last channel / close the list */
    XS_ACT_LIST,         /* Select: channel list */
    XS_ACT_ENTER,        /* keyboard Enter: tune the digits typed */
+   XS_ACT_FAV,          /* X: favourite on/off */
+   XS_ACT_NEXT_FAV,     /* Y: next favourite */
    XS_ACT_DIGIT0        /* + 0..9: keyboard digits */
 } xs_action_t;
 

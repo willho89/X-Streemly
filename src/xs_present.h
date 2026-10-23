@@ -39,6 +39,11 @@ void xs_present_set_name(xs_present_t *p, const char *name);
 void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frames,
                      xs_picture_t *pic);
 
+/* The card shown before anything is tuned (default: NO CONTENT). */
+void xs_present_set_idle(xs_present_t *p, const char *title, const char *detail);
+/* The current tune has shown a picture. */
+bool xs_present_has_picture(const xs_present_t *p);
+
 /* The last tick showed a card (tuning, no signal ...), not the stream. */
 bool xs_present_card_showing(const xs_present_t *p);
 
