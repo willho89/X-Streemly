@@ -4,9 +4,10 @@ A [libretro](https://www.libretro.com/) core for **network video**: tune in to l
 channels on a TV. Developed and tested in RetroArch; support for [VRT](https://github.com/willho89/VRT) (an
 emulated CRT TV for Meta Quest) comes later.
 
-> **Status: early development (M4 done).** Start the core in RetroArch with no content and it shows the channels of
-> an HDHomeRun tuner on your network, or iptv-org's free channels for your country; or load your own M3U list. No
-> release yet.
+> **Status: first pre-release, [v0.1.0](https://github.com/willho89/X-Streemly/releases/tag/v0.1.0).** Start the
+> core in RetroArch with no content and it shows the channels of an HDHomeRun tuner on your network, or iptv-org's
+> free channels for your country; or load your own M3U list. Builds for Linux (x86_64, ARM), Windows, macOS and
+> Android; developed and tested on Linux, the others tested in CI only so far.
 
 ## What works
 - **Live streams over HTTP(S):** HLS (MPEG-TS segments) and plain MPEG-TS, plus files over HTTP.
@@ -34,6 +35,9 @@ emulated CRT TV for Meta Quest) comes later.
 - **On-screen display drawn into the picture:** channel number and name, tuning / no signal / end of stream cards.
 
 ## Trying it
+Download the zip for your system from the [releases](https://github.com/willho89/X-Streemly/releases) and follow
+its `INSTALL.txt` (copy the core into RetroArch's `cores` folder and the `.info` file into `info`).
+
 In RetroArch, load the core and choose **Start Core**: you get your HDHomeRun's channels, or iptv-org's for the
 country in the core options (*Channels → Country*, default United Kingdom). Or load an `.m3u` channel list. For a
 single stream, or a channel list on the web, write its URL into a text file ending in `.strm`:
@@ -54,7 +58,6 @@ https://example.com/live/channel/playlist.m3u8
 | Keyboard 0–9 (and . for 3.1) | Channel number |
 
 ## Planned
-- **Releases:** builds for Linux, Windows, macOS and Android.
 - **VRT:** standard-definition output and interlaced streams sent field by field to VRT's virtual CRT.
 - **Later:** a companion app for Linux and Windows that casts a low-resolution virtual monitor (an app, a video
   player…) to X-Streemly over the network.
