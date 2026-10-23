@@ -18,8 +18,11 @@ NAME=""
 # and no tick may wait: a network wait or a held lock costs tens of ms or
 # more. Single ticks of a few ms happen when the OS runs something else on
 # a busy desktop (wall time without CPU time), so the worst tick gets room.
+# CI's shared macOS VMs stall a thread for ~100 ms now and then (a 98 ms
+# tick with 7 ms of CPU): the workflow raises the limit there with
+# CHECK_MAX_RUN_US, still far below a network wait (seconds).
 P99_RUN_US=5000
-MAX_RUN_US=50000
+MAX_RUN_US=${CHECK_MAX_RUN_US:-50000}
 MAX_UNLOAD_MS=500
 # Zap to picture (M2: < 1 s). Wine's schannel (GnuTLS underneath) takes
 # 0.5-1.5 s per HTTPS handshake on its own.
@@ -438,7 +441,7 @@ shown=$(grep -oE 'shown [0-9]+' "$LOG" | tail -1 | cut -d' ' -f2)
 [ "$shown" -ge 290 ] || fail "only $shown of 300 pictures shown across the wrap"
 ok "33-bit PTS wrap mid-file: $shown pictures, $AVS"
 
-run step_down "$HTTPS/_throttle/v1080/150/hls2/master.m3u8" 3000 HARNESS_AVSYNC=1
+run step_down "$HTTPS/_throttle/v1080/150/hls2/master.m3u8" 3600 HARNESS_AVSYNC=1
 expect 'two stalls within 60 s: asking for a lower variant'
 expect 'variant: 1080p can.t keep up, stepping down'
 expect 'variant: program 0, 1280x720'

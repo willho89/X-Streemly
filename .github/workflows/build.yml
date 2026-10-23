@@ -188,6 +188,8 @@ jobs:
         run: make -j3
       - name: Test
         run: make check
+        env:
+          CHECK_MAX_RUN_US: 250000
       - name: Package
         run: tests/ci/package.sh ./xstreemly_libretro.dylib "strip -x" macos-${{ matrix.arch }} "${VERSION#v}"
       - uses: actions/upload-artifact@v4
