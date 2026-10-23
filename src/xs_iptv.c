@@ -28,6 +28,7 @@
 #include <rthreads/rthreads.h>
 
 #include "xs_fetch.h"
+#include "xs_hdhr.h"
 #include "xs_iptv.h"
 #include "xs_iptv_tables.h"
 
@@ -75,8 +76,15 @@ static const char *label(const struct retro_core_option_value *v, const char *va
 
 void xs_iptv_describe(const xs_iptv_query_t *q, char *out, size_t len)
 {
-   size_t n = (size_t)snprintf(out, len, "IPTV-ORG %s",
-                               strcmp(q->country, "all") ? label(g_countries, q->country) : "ALL COUNTRIES");
+   size_t n;
+   if (!strcmp(q->source, "hdhomerun"))
+   {
+      snprintf(out, len, "HDHOMERUN");
+      return;
+   }
+   n = (size_t)snprintf(out, len, "%sIPTV-ORG %s",
+                        !strcmp(q->source, "auto") ? "HDHOMERUN OR " : !strcmp(q->source, "both") ? "HDHOMERUN + " : "",
+                        strcmp(q->country, "all") ? label(g_countries, q->country) : "ALL COUNTRIES");
    if (strcmp(q->language, "any") && n < len)
       n += (size_t)snprintf(out + n, len - n, ", %s", label(g_languages, q->language));
    if (strcmp(q->category, "all") && n < len)
@@ -85,7 +93,7 @@ void xs_iptv_describe(const xs_iptv_query_t *q, char *out, size_t len)
 
 void xs_iptv_key(const xs_iptv_query_t *q, char *out, size_t len)
 {
-   snprintf(out, len, "iptv-org:%s:%s:%s:%d%d", q->country, q->language, q->category,
+   snprintf(out, len, "%s:%s:%s:%s:%d%d", q->source, q->country, q->language, q->category,
             q->hide_geoblocked, q->hide_not_247);
 }
 
@@ -349,6 +357,72 @@ static bool build_iptv(xs_iptv_t *it, const xs_iptv_query_t *q, xs_playlist_t *o
    return true;
 }
 
+/* HDHomeRun tuners first (§M3b), then iptv-org, as the source asks. In
+ * "both" (and "auto" with a tuner found) the iptv-org channels are numbered
+ * from 1001 so they can't clash with broadcast numbers like 3.1. */
+static bool build_lineup(xs_iptv_t *it, const xs_iptv_query_t *q, xs_playlist_t *out, char *msg, size_t msglen)
+{
+   bool want_hdhr = strcmp(q->source, "iptv") != 0;
+   bool want_iptv = strcmp(q->source, "hdhomerun") != 0;
+   xs_hdhr_dev_t devs[XS_HDHR_MAX];
+   unsigned ndev = 0, i, local = 0;
+   xs_playlist_t iptv;
+   char err[256] = "";
+
+   memset(out, 0, sizeof(*out));
+   if (want_hdhr)
+   {
+      set_state(it, ST_WORKING, "LOOKING FOR AN HDHOMERUN");
+      ndev = xs_hdhr_discover(it->ctx, devs, XS_HDHR_MAX, stop_cb, it);
+      for (i = 0; i < ndev && !stop_cb(it); i++)
+      {
+         char e[256];
+         set_state(it, ST_WORKING, "READING THE HDHOMERUN LINEUP");
+         if (!xs_hdhr_lineup(it->ctx, &devs[i], out, e, sizeof(e), stop_cb, it))
+         {
+            XS_WARN(it->ctx, "hdhomerun: %s\n", e);
+            snprintf(err, sizeof(err), "%s", e);
+         }
+      }
+      local = out->n;
+      if (!strcmp(q->source, "auto") && local)
+         want_iptv = false;   /* auto: the tuner's channels when there is one */
+   }
+   if (!want_iptv)
+   {
+      if (local)
+      {
+         snprintf(msg, msglen, "%u CHANNELS", local);
+         return true;
+      }
+      snprintf(msg, msglen, "%s", err[0] ? err : ndev ? "NO CHANNELS ON THE HDHOMERUN" : "NO HDHOMERUN FOUND");
+      return false;
+   }
+   if (!build_iptv(it, q, &iptv, msg, msglen))
+   {
+      if (local)
+      {
+         XS_WARN(it->ctx, "lineup: iptv-org: %s; local channels only\n", msg);
+         snprintf(msg, msglen, "%u CHANNELS", local);
+         return true;
+      }
+      return false;
+   }
+   if (!local)
+   {
+      *out = iptv;
+      return true;
+   }
+   for (i = 0; i < iptv.n; i++)
+   {
+      iptv.e[i].chno = XS_CHNO(1001 + i, 0);
+      xs_playlist_push(out, &iptv.e[i]);
+   }
+   xs_playlist_free(&iptv);
+   snprintf(msg, msglen, "%u CHANNELS", out->n);
+   return true;
+}
+
 static bool build_url(xs_iptv_t *it, const char *url, const char *ua, const char *ref,
                       xs_playlist_t *out, char *msg, size_t msglen)
 {
@@ -414,7 +488,7 @@ static void worker(void *arg)
       slock_unlock(it->lock);
 
       memset(&pl, 0, sizeof(pl));
-      ok = kind == JOB_IPTV ? build_iptv(it, &q, &pl, msg, sizeof(msg))
+      ok = kind == JOB_IPTV ? build_lineup(it, &q, &pl, msg, sizeof(msg))
                             : build_url(it, url, ua, ref, &pl, msg, sizeof(msg));
 
       slock_lock(it->lock);

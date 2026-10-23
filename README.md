@@ -4,8 +4,9 @@ A [libretro](https://www.libretro.com/) core for **network video**: tune in to l
 channels on a TV. Developed and tested in RetroArch; support for [VRT](https://github.com/willho89/VRT) (an
 emulated CRT TV for Meta Quest) comes later.
 
-> **Status: early development (M2 done).** Load an M3U channel list (or a `.strm` file with one URL) in RetroArch
-> and flip through the channels like a TV. Built-in iptv-org channel lists come next. No release yet.
+> **Status: early development (M3 done).** Start the core in RetroArch with no content and it shows the channels of
+> an HDHomeRun tuner on your network, or iptv-org's free channels for your country; or load your own M3U list. No
+> release yet.
 
 ## What works
 - **Live streams over HTTP(S):** HLS (MPEG-TS segments) and plain MPEG-TS, plus files over HTTP.
@@ -17,16 +18,20 @@ emulated CRT TV for Meta Quest) comes later.
   correction keeps the buffer steady whatever the broadcaster's clock does.
 - **Rides out a bad connection:** holds the picture through a stall, re-buffers, reconnects without losing what's
   buffered, and learns a bigger buffer for streams that need one.
-- **Channel lists:** M3U/M3U8 playlists (including iptv-org's), numbered in order or by `tvg-chno`; encrypted (DRM)
+- **TV out of the box:** with no content, the channels of an **HDHomeRun** network tuner if one is on the LAN (found
+  automatically; ATSC channels numbered 3.1, 3.2 …), else **iptv-org**'s free public channels, filtered by country,
+  category and language, cached for offline use. Channels that don't answer are skipped for a day.
+- **Channel lists:** M3U/M3U8 playlists, local or at a URL, numbered in order or by `tvg-chno`; encrypted (DRM)
   channels are recognised and skipped.
+- **Favourites:** X marks one, Y jumps to the next.
 - **TV-style control:** channel up/down (the tune waits until you stop flicking), last channel, previous/next group,
   number entry on the keyboard, a channel list, an info band; the last channel is remembered.
 - **On-screen display drawn into the picture:** channel number and name, tuning / no signal / end of stream cards.
 
 ## Trying it
-Load an `.m3u` channel list with the core in RetroArch, for example one of iptv-org's
-(`https://iptv-org.github.io/iptv/countries/uk.m3u`, saved to a file). For a single stream, write its URL into a
-text file ending in `.strm`:
+In RetroArch, load the core and choose **Start Core**: you get your HDHomeRun's channels, or iptv-org's for the
+country in the core options (*Channels → Country*, default United Kingdom). Or load an `.m3u` channel list. For a
+single stream, or a channel list on the web, write its URL into a text file ending in `.strm`:
 
 ```
 https://example.com/live/channel/playlist.m3u8
@@ -39,14 +44,13 @@ https://example.com/live/channel/playlist.m3u8
 | L / R | Previous / next group |
 | A | Info |
 | Select | Channel list (Up/Down, A to tune, B to close) |
-| Keyboard 0–9 | Channel number |
+| X / Y | Favourite on/off / next favourite |
+| Keyboard 0–9 (and . for 3.1) | Channel number |
 
 ## Planned
 - **Free IPTV out of the box:** channel lists from [iptv-org](https://github.com/iptv-org/iptv), a community
   collection of publicly available TV streams, browsable by country, category and language. X-Streemly hosts no
   streams.
-- **Playlists from the web:** a `.strm` pointing at an online M3U list.
-- **Favourites.**
 - **VRT:** standard-definition output and interlaced streams sent field by field to VRT's virtual CRT.
 - **Later:** a companion app for Linux and Windows that casts a low-resolution virtual monitor (an app, a video
   player…) to X-Streemly over the network.

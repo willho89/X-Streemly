@@ -188,7 +188,7 @@ static void show_message(unsigned ms, bool alert, const char *fmt, ...)
 /* ---- core options --------------------------------------------------------- */
 
 static struct retro_core_option_v2_category g_opt_categories[] = {
-   { "iptv", "Channels", "The free iptv-org channels, used when the core starts without content." },
+   { "iptv", "Channels", "The lineup used when the core starts without content: an HDHomeRun tuner and/or iptv-org." },
    { "video", "Video", "Resolution and deinterlacing." },
    { "advanced", "Advanced", "Buffering and logging." },
    { NULL, NULL, NULL },
@@ -219,6 +219,15 @@ static struct retro_core_option_v2_definition g_opt_defs[] = {
       NULL, "video",
       { { "on", "On" }, { "off", "Off" }, { NULL, NULL } },
       "on"
+   },
+   {
+      "xstreemly_source", "Lineup", NULL,
+      "Where the channels come from when the core starts without content. 'Auto' uses an "
+      "HDHomeRun tuner on your network if there is one, else iptv-org's free channels.",
+      NULL, "iptv",
+      { { "auto", "Auto" }, { "iptv", "iptv-org" }, { "hdhomerun", "HDHomeRun" },
+        { "both", "HDHomeRun + iptv-org" }, { NULL, NULL } },
+      "auto"
    },
    {
       "xstreemly_country", "Country", NULL,
@@ -350,6 +359,8 @@ static void read_query(xs_iptv_query_t *q)
 {
    const char *v;
    memset(q, 0, sizeof(*q));
+   v = get_option("xstreemly_source");
+   snprintf(q->source, sizeof(q->source), "%s", v ? v : "auto");
    v = get_option("xstreemly_country");
    snprintf(q->country, sizeof(q->country), "%s", v ? v : "uk");
    v = get_option("xstreemly_language");
@@ -412,7 +423,7 @@ static void update_lineup(bool options_changed)
    if (r == 0)
    {
       char detail[512];
-      snprintf(detail, sizeof(detail), "%s: %s", what, msg);
+      snprintf(detail, sizeof(detail), "%.250s: %.250s", what, msg);
       xs_present_set_idle(g_present, "LOADING CHANNELS", detail);
    }
    else if (r < 0)

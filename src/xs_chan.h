@@ -55,7 +55,7 @@ void xs_chan_free(xs_chan_t *c);
 
 unsigned xs_chan_count(const xs_chan_t *c);
 const xs_entry_t *xs_chan_entry(const xs_chan_t *c, unsigned idx);
-unsigned xs_chan_number(const xs_chan_t *c, unsigned idx);
+unsigned xs_chan_number(const xs_chan_t *c, unsigned idx);   /* XS_CHNO */
 
 /* Entry dir steps away from idx (wrapping), skipping unplayable ones and
  * ones that failed in the last day (unless all of them did). */
@@ -64,8 +64,11 @@ unsigned xs_chan_step(const xs_chan_t *c, unsigned idx, int dir);
 unsigned xs_chan_group_step(const xs_chan_t *c, unsigned idx, int dir);
 /* Entry with this channel number; false if none. */
 bool xs_chan_find(const xs_chan_t *c, unsigned number, unsigned *idx);
-/* Highest channel number (for number entry). */
-unsigned xs_chan_max_number(const xs_chan_t *c);
+/* An entry's number as text ("3.1", "7"); returns buf. */
+const char *xs_chan_number_str(const xs_chan_t *c, unsigned idx, char *buf, size_t len);
+/* Number entry: how many channel numbers start with the typed text, and
+ * whether one is exactly it. */
+unsigned xs_chan_match(const xs_chan_t *c, const char *typed, bool *exact);
 
 /* Make idx the channel on (the old one becomes "previous"). */
 void xs_chan_set(xs_ctx_t *ctx, xs_chan_t *c, unsigned idx);

@@ -161,6 +161,38 @@ static void resolve(const char *base, const char *ref, char *out, size_t len, bo
       copy(out, len, ref, strlen(ref));
 }
 
+/* ---- channel numbers ---------------------------------------------------- */
+
+unsigned xs_chno_parse(const char *s)
+{
+   char *end;
+   unsigned long major, minor = 0;
+   while (*s == ' ')
+      s++;
+   if (!isdigit((unsigned char)*s))
+      return 0;
+   major = strtoul(s, &end, 10);
+   if (*end == '.' || *end == '-' || *end == '_')
+   {
+      if (!isdigit((unsigned char)end[1]))
+         return 0;
+      minor = strtoul(end + 1, &end, 10);
+   }
+   while (*end == ' ')
+      end++;
+   if (*end || major == 0 || major > 4000000 || minor > 999)
+      return 0;
+   return XS_CHNO((unsigned)major, (unsigned)minor);
+}
+
+void xs_chno_format(unsigned n, char *out, size_t len)
+{
+   if (XS_CHNO_MINOR(n))
+      snprintf(out, len, "%u.%u", XS_CHNO_MAJOR(n), XS_CHNO_MINOR(n));
+   else
+      snprintf(out, len, "%u", XS_CHNO_MAJOR(n));
+}
+
 /* ---- #EXTINF -------------------------------------------------------------- */
 
 static void set_attr(xs_entry_t *e, const char *key, size_t klen, const char *val, size_t vlen)
@@ -181,8 +213,7 @@ static void set_attr(xs_entry_t *e, const char *key, size_t klen, const char *va
    {
       char num[16];
       copy(num, sizeof(num), val, vlen);
-      if (isdigit((unsigned char)num[0]))
-         e->chno = atoi(num);
+      e->chno = xs_chno_parse(num);
    }
    else if (KEY("group-title"))
       copy(e->group, sizeof(e->group), val, vlen);
@@ -280,10 +311,9 @@ static void strip_suffixes(xs_entry_t *e)
 static void entry_init(xs_entry_t *e)
 {
    memset(e, 0, sizeof(*e));
-   e->chno = -1;
 }
 
-static bool push(xs_playlist_t *pl, const xs_entry_t *e)
+bool xs_playlist_push(xs_playlist_t *pl, const xs_entry_t *e)
 {
    if (pl->n == pl->cap)
    {
@@ -331,7 +361,7 @@ bool xs_playlist_parse(const char *text, size_t len, const char *base, xs_playli
       cur.local = !has_scheme(base);
       out->hls = true;
       free(buf);
-      return push(out, &cur);
+      return xs_playlist_push(out, &cur);
    }
 
    entry_init(&cur);
@@ -392,7 +422,7 @@ bool xs_playlist_parse(const char *text, size_t len, const char *base, xs_playli
       if (!cur.group[0] && group[0])
          copy(cur.group, sizeof(cur.group), group, strlen(group));
       strip_suffixes(&cur);
-      if (!push(out, &cur))
+      if (!xs_playlist_push(out, &cur))
          break;
       entry_init(&cur);
       title[0] = '\0';

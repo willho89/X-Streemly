@@ -38,14 +38,14 @@ static void number_channels(xs_chan_t *c)
    bool own = true;
    for (i = 0; i < c->pl.n && own; i++)
    {
-      if (c->pl.e[i].chno <= 0)
+      if (!c->pl.e[i].chno)
          own = false;
       for (j = 0; j < i && own; j++)
          if (c->pl.e[j].chno == c->pl.e[i].chno)
             own = false;
    }
    for (i = 0; i < c->pl.n; i++)
-      c->number[i] = own ? (unsigned)c->pl.e[i].chno : i + 1;
+      c->number[i] = own ? c->pl.e[i].chno : XS_CHNO(i + 1, 0);
 }
 
 /* FNV-1a of the content path: one remembered state per lineup. */
@@ -66,16 +66,21 @@ static void load_state(xs_ctx_t *ctx, xs_chan_t *c)
       return;
    while (fgets(line, sizeof(line), f))
    {
-      if (!strncmp(line, "channel=", 8) && xs_chan_find(c, (unsigned)atoi(line + 8), &idx))
+      line[strcspn(line, "\r\n")] = '\0';
+      if (!strncmp(line, "channel=", 8) && xs_chan_find(c, xs_chno_parse(line + 8), &idx))
          c->cur = idx;
-      else if (!strncmp(line, "previous=", 9) && xs_chan_find(c, (unsigned)atoi(line + 9), &idx))
+      else if (!strncmp(line, "previous=", 9) && xs_chan_find(c, xs_chno_parse(line + 9), &idx))
       {
          c->prev = idx;
          c->have_prev = true;
       }
    }
    fclose(f);
-   XS_INFO(ctx, "lineup: back on channel %u\n", c->number[c->cur]);
+   {
+      char num[16];
+      xs_chno_format(c->number[c->cur], num, sizeof(num));
+      XS_INFO(ctx, "lineup: back on channel %s\n", num);
+   }
 }
 
 static void save_state(xs_ctx_t *ctx, const xs_chan_t *c)
@@ -89,9 +94,16 @@ static void save_state(xs_ctx_t *ctx, const xs_chan_t *c)
       XS_WARN(ctx, "can't write %s: %s\n", c->state_path, strerror(errno));
       return;
    }
-   fprintf(f, "channel=%u\n", c->number[c->cur]);
-   if (c->have_prev)
-      fprintf(f, "previous=%u\n", c->number[c->prev]);
+   {
+      char num[16];
+      xs_chno_format(c->number[c->cur], num, sizeof(num));
+      fprintf(f, "channel=%s\n", num);
+      if (c->have_prev)
+      {
+         xs_chno_format(c->number[c->prev], num, sizeof(num));
+         fprintf(f, "previous=%s\n", num);
+      }
+   }
    fclose(f);
 }
 
@@ -211,11 +223,13 @@ static void finish(xs_ctx_t *ctx, xs_chan_t *c, const char *key, const char *sav
    for (i = 0; i < c->pl.n; i++)
    {
       const xs_entry_t *e = &c->pl.e[i];
-      XS_DEBUG(ctx, "channel %u: \"%s\" group \"%s\" tvg-id \"%s\" %up%s%s%s url %s%s%s%s%s\n",
-               c->number[i], e->name, e->group, e->tvg_id, e->height,
+      char num[16];
+      xs_chno_format(c->number[i], num, sizeof(num));
+      XS_DEBUG(ctx, "channel %s: \"%s\" group \"%s\" tvg-id \"%s\" %up%s%s%s url %s%s%s%s%s\n",
+               num, e->name, e->group, e->tvg_id, e->height,
                e->flags & XS_CH_GEOBLOCKED ? " geo-blocked" : "",
                e->flags & XS_CH_NOT_247 ? " not-24/7" : "",
-               e->flags & XS_CH_DRM ? " DRM" : "", e->url,
+               e->flags & XS_CH_DRM ? " DRM" : e->flags & XS_CH_NOCODEC ? " no-codec" : "", e->url,
                e->user_agent[0] ? " ua " : "", e->user_agent,
                e->referrer[0] ? " referrer " : "", e->referrer);
    }
@@ -274,7 +288,6 @@ bool xs_chan_load(xs_ctx_t *ctx, xs_chan_t *c, const char *content, const char *
       if (!pl.e)
          return false;
       pl.n = pl.cap = 1;
-      pl.e[0].chno = -1;
       snprintf(pl.e[0].name, sizeof(pl.e[0].name), "%s", src.name);
       snprintf(pl.e[0].url, sizeof(pl.e[0].url), "%s", src.url);
       pl.e[0].local = src.local;
@@ -317,7 +330,7 @@ unsigned xs_chan_step(const xs_chan_t *c, unsigned idx, int dir)
       for (i = 1; i <= n; i++)
       {
          unsigned j = (unsigned)(((int)idx + dir * (int)i) % (int)n + (int)n) % n;
-         if (!(c->pl.e[j].flags & XS_CH_DRM) && (pass || !xs_chan_is_dead(c, j)))
+         if (!(c->pl.e[j].flags & XS_CH_UNPLAYABLE) && (pass || !xs_chan_is_dead(c, j)))
             return j;
       }
    return idx;
@@ -356,13 +369,29 @@ bool xs_chan_find(const xs_chan_t *c, unsigned number, unsigned *idx)
    return false;
 }
 
-unsigned xs_chan_max_number(const xs_chan_t *c)
+const char *xs_chan_number_str(const xs_chan_t *c, unsigned idx, char *buf, size_t len)
 {
-   unsigned i, m = 0;
+   xs_chno_format(c->number[idx], buf, len);
+   return buf;
+}
+
+unsigned xs_chan_match(const xs_chan_t *c, const char *typed, bool *exact)
+{
+   unsigned i, n = 0;
+   size_t tl = strlen(typed);
+   *exact = false;
    for (i = 0; i < c->pl.n; i++)
-      if (c->number[i] > m)
-         m = c->number[i];
-   return m;
+   {
+      char num[16];
+      xs_chno_format(c->number[i], num, sizeof(num));
+      if (!strncmp(num, typed, tl))
+      {
+         n++;
+         if (!num[tl])
+            *exact = true;
+      }
+   }
+   return n;
 }
 
 void xs_chan_mark_dead(xs_chan_t *c, unsigned idx, bool dead)

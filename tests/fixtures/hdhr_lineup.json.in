@@ -1,0 +1,5 @@
+[{"GuideNumber":"3.1","GuideName":"FAKE-HD","VideoCodec":"H264","AudioCodec":"AAC","HD":1,"URL":"@HTTPS@/hls2/master.m3u8"},
+{"GuideNumber":"3.2","GuideName":"FAKE SD","VideoCodec":"MPEG2","AudioCodec":"MP2","URL":"@HTTP@/i576.ts"},
+{"GuideNumber":"8.1","GuideName":"FAKE DRM","VideoCodec":"HEVC","AudioCodec":"AC4","HD":1,"DRM":1,"URL":"@HTTPS@/hls2/master.m3u8"},
+{"GuideNumber":"8.2","GuideName":"FAKE AC4","VideoCodec":"HEVC","AudioCodec":"AC4","URL":"@HTTPS@/hls2/master.m3u8"},
+{"GuideNumber":"49.10","GuideName":"BUSY","VideoCodec":"MPEG2","AudioCodec":"AC3","URL":"@HTTP@/_status/503/auto/v49.10"}]

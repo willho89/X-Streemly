@@ -18,7 +18,7 @@
  *   HARNESS_INPUT="300:A,900:UP*60" press a RetroPad button on a frame, held
  *                                   for 2 frames or *N frames; names: A B X Y
  *                                   L R L2 R2 L3 R3 START SELECT UP DOWN LEFT
- *                                   RIGHT, keyboard K0..K9 KENTER
+ *                                   RIGHT, keyboard K0..K9 KENTER KDOT
  *   HARNESS_DUMP=<dir>              write PPM snapshots there...
  *   HARNESS_DUMP_FRAMES="60,600"    ...at these frame numbers (default: 60)
  *   HARNESS_DUMP_EVERY=<n>          ...or every n frames
@@ -241,7 +241,8 @@ static void parse_input(const char *spec)
       if (colon[1] == 'K' && colon[2])
       {
          g_input[g_ninput].frame = (unsigned)atoi(tok);
-         g_input[g_ninput].id    = !strcmp(colon + 2, "ENTER") ? RETROK_RETURN : RETROK_0 + (unsigned)atoi(colon + 2);
+         g_input[g_ninput].id    = !strcmp(colon + 2, "ENTER") ? RETROK_RETURN :
+                                   !strcmp(colon + 2, "DOT") ? RETROK_PERIOD : RETROK_0 + (unsigned)atoi(colon + 2);
          g_input[g_ninput].hold  = hold;
          g_input[g_ninput].key   = true;
          g_ninput++;

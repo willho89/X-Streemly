@@ -20,6 +20,8 @@
 
 typedef struct
 {
+   char     source[12];      /* "auto" (HDHomeRun if found, else iptv-org), "iptv",
+                                "hdhomerun", "both" */
    char     country[8];      /* "uk", or "all" */
    char     language[8];     /* "eng", or "any" */
    char     category[64];    /* group-title name ("News"), or "all" */

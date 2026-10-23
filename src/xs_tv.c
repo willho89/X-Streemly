@@ -22,7 +22,7 @@
 #define XS_INFO_MS         6000
 #define XS_NOTE_MS         2500
 #define XS_DIGITS_MS       1500
-#define XS_MAX_DIGITS      4
+#define XS_MAX_DIGITS      7      /* "1234.56" */
 #define XS_SAVE_AFTER_MS   5000   /* write the last channel once it has settled */
 #define XS_AUTO_TRIES      20     /* dead channels skipped on our own at start */
 
@@ -116,16 +116,19 @@ static void tune(xs_tv_t *tv, unsigned idx)
    tv->have_pending = false;
    tv->banner_until = after_ms(tv, XS_BANNER_MS);
    tv->banner_idx   = idx;
-   if (e->flags & XS_CH_DRM)
+   if (e->flags & XS_CH_UNPLAYABLE)
    {
-      note(tv, "ENCRYPTED: CAN'T PLAY");
+      note(tv, e->flags & XS_CH_DRM ? "ENCRYPTED: CAN'T PLAY" : "CAN'T PLAY: AC-4 AUDIO");
       return;
    }
    xs_chan_set(tv->ctx, &tv->chan, idx);
    tv->tuned_tick = tv->ticks;
    xs_chan_source(&tv->chan, idx, &src);
    xs_present_set_name(tv->present, e->name);
-   XS_INFO(tv->ctx, "channel %u: %s\n", xs_chan_number(&tv->chan, idx), e->name);
+   {
+      char num[16];
+      XS_INFO(tv->ctx, "channel %s: %s\n", xs_chan_number_str(&tv->chan, idx, num, sizeof(num)), e->name);
+   }
    tv->watch_gen = xs_tuner_tune(tv->tuner, &src);
    tv->watch_idx = idx;
    tv->watching  = true;
@@ -137,7 +140,7 @@ void xs_tv_start(xs_tv_t *tv)
    if (!xs_chan_count(&tv->chan))
       return;
    /* Start on a channel that isn't known to be dead. */
-   idx = xs_chan_is_dead(&tv->chan, tv->chan.cur) || (xs_chan_entry(&tv->chan, tv->chan.cur)->flags & XS_CH_DRM)
+   idx = xs_chan_is_dead(&tv->chan, tv->chan.cur) || (xs_chan_entry(&tv->chan, tv->chan.cur)->flags & XS_CH_UNPLAYABLE)
        ? xs_chan_step(&tv->chan, tv->chan.cur, 1) : tv->chan.cur;
    tv->auto_tries = XS_AUTO_TRIES;
    tv->banner_idx = idx;
@@ -157,15 +160,26 @@ static void watch_tune(xs_tv_t *tv)
       return;
    if (xs_present_has_picture(tv->present) || (st.state == XS_TUNER_PLAYING && !st.has_video && st.packets))
    {
+      char num[16];
       if (xs_chan_is_dead(&tv->chan, tv->watch_idx))
-         XS_INFO(tv->ctx, "channel %u works again\n", xs_chan_number(&tv->chan, tv->watch_idx));
+         XS_INFO(tv->ctx, "channel %s works again\n", xs_chan_number_str(&tv->chan, tv->watch_idx, num, sizeof(num)));
       xs_chan_mark_dead(&tv->chan, tv->watch_idx, false);
+      tv->watching = false;
+   }
+   else if (st.state == XS_TUNER_FAILED && !st.packets &&
+            (xs_chan_entry(&tv->chan, tv->watch_idx)->flags & XS_CH_TUNER))
+   {
+      /* A local tuner: a failure is a busy tuner or a weak signal, not a
+       * dead channel. HDHomeRun answers 503 when all its tuners are in use. */
+      if (strstr(st.msg, "5XX"))
+         note(tv, "NO FREE TUNER (ALL IN USE?)");
       tv->watching = false;
    }
    else if (st.state == XS_TUNER_FAILED && !st.packets)
    {
-      XS_INFO(tv->ctx, "channel %u is dead (%s): skipped for a day\n",
-              xs_chan_number(&tv->chan, tv->watch_idx), st.msg);
+      char num[16];
+      XS_INFO(tv->ctx, "channel %s is dead (%s): skipped for a day\n",
+              xs_chan_number_str(&tv->chan, tv->watch_idx, num, sizeof(num)), st.msg);
       xs_chan_mark_dead(&tv->chan, tv->watch_idx, true);
       tv->watching = false;
       if (tv->auto_tries && xs_chan_count(&tv->chan) > 1)
@@ -192,14 +206,17 @@ static void move_pending(xs_tv_t *tv, unsigned idx)
 
 static void commit_digits(xs_tv_t *tv)
 {
-   unsigned idx, n = (unsigned)atoi(tv->digits);
+   unsigned idx, n = xs_chno_parse(tv->digits);
    char msg[64];
-   tv->digits[0] = '\0';
-   if (xs_chan_find(&tv->chan, n, &idx))
+   if (n && xs_chan_find(&tv->chan, n, &idx))
+   {
+      tv->digits[0] = '\0';
       tune(tv, idx);
+   }
    else
    {
-      snprintf(msg, sizeof(msg), "NO CHANNEL %u", n);
+      snprintf(msg, sizeof(msg), "NO CHANNEL %s", tv->digits);
+      tv->digits[0] = '\0';
       note(tv, msg);
       tv->banner_until = after_ms(tv, XS_NOTE_MS);
    }
@@ -234,19 +251,23 @@ static void handle(xs_tv_t *tv, unsigned act, unsigned rows)
       return;
    }
 
-   if (act >= XS_ACT_DIGIT0 && act < XS_ACT_DIGIT0 + 10)
+   if ((act >= XS_ACT_DIGIT0 && act < XS_ACT_DIGIT0 + 10) || act == XS_ACT_DOT)
    {
       size_t n = strlen(tv->digits);
-      if (n < XS_MAX_DIGITS && !(n == 0 && act == XS_ACT_DIGIT0))
-      {
-         tv->digits[n]     = (char)('0' + (act - XS_ACT_DIGIT0));
-         tv->digits[n + 1] = '\0';
-         tv->digits_tick   = tv->ticks;
-         tv->have_pending  = false;
-         /* No longer number can exist: tune now. */
-         if ((unsigned)atoi(tv->digits) * 10 > xs_chan_max_number(&tv->chan))
-            commit_digits(tv);
-      }
+      bool dot = act == XS_ACT_DOT, exact;
+      unsigned matches;
+      if (n >= XS_MAX_DIGITS || (n == 0 && (dot || act == XS_ACT_DIGIT0)) ||
+          (dot && strchr(tv->digits, '.')))
+         return;
+      tv->digits[n]     = dot ? '.' : (char)('0' + (act - XS_ACT_DIGIT0));
+      tv->digits[n + 1] = '\0';
+      tv->digits_tick   = tv->ticks;
+      tv->have_pending  = false;
+      /* Tune as soon as no longer channel number starts like this ("3.1"
+       * with no 3.10..3.19; "24" with no 240..). */
+      matches = xs_chan_match(&tv->chan, tv->digits, &exact);
+      if (!matches || (exact && matches == 1))
+         commit_digits(tv);
       return;
    }
 
@@ -334,8 +355,9 @@ static void build_overlay(xs_tv_t *tv, unsigned pic_h)
    else if (tv->ticks < tv->banner_until || tv->have_pending)
    {
       ov.banner = true;
-      snprintf(ov.number, sizeof(ov.number), "%s%u", xs_chan_is_fav(&tv->chan, shown) ? "*" : "",
-               xs_chan_number(&tv->chan, shown));
+      char num[16];
+      snprintf(ov.number, sizeof(ov.number), "%s%s", xs_chan_is_fav(&tv->chan, shown) ? "*" : "",
+               xs_chan_number_str(&tv->chan, shown, num, sizeof(num)));
       if (!card || shown != tv->chan.cur)
       {
          snprintf(ov.name, sizeof(ov.name), "%s", e->name);
@@ -351,7 +373,9 @@ static void build_overlay(xs_tv_t *tv, unsigned pic_h)
       xs_tuner_status_t st;
       xs_tuner_get_status(tv->tuner, &st);
       ov.info = true;
-      snprintf(ov.info_line[0], sizeof(ov.info_line[0]), "%u  %.240s", xs_chan_number(&tv->chan, tv->chan.cur), c->name);
+      char num[16];
+      snprintf(ov.info_line[0], sizeof(ov.info_line[0]), "%s  %.230s",
+               xs_chan_number_str(&tv->chan, tv->chan.cur, num, sizeof(num)), c->name);
       snprintf(ov.info_line[1], sizeof(ov.info_line[1]), "%s%s%s", c->group,
                c->flags & XS_CH_GEOBLOCKED ? "  GEO-BLOCKED" : "",
                c->flags & XS_CH_NOT_247 ? "  NOT 24/7" : "");
@@ -383,7 +407,8 @@ static void build_overlay(xs_tv_t *tv, unsigned pic_h)
       {
          unsigned idx = tv->top + i;
          const xs_entry_t *r = xs_chan_entry(&tv->chan, idx);
-         snprintf(ov.list_row[i], sizeof(ov.list_row[i]), "%4u %c %.130s%s", xs_chan_number(&tv->chan, idx),
+         char num[16];
+         snprintf(ov.list_row[i], sizeof(ov.list_row[i]), "%6s %c %.130s%s", xs_chan_number_str(&tv->chan, idx, num, sizeof(num)),
                   xs_chan_is_fav(&tv->chan, idx) ? '*' : ' ', r->name,
                   xs_chan_is_dead(&tv->chan, idx) ? "  (NO SIGNAL)" : "");
          if (idx == tv->cursor)

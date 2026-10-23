@@ -47,7 +47,8 @@ static uint32_t read_buttons(xs_input_t *in, retro_input_state_t cb)
    return bits;
 }
 
-/* Digits 0-9 (top row or keypad) as bits 0-9, Enter as bit 10. */
+/* Digits 0-9 (top row or keypad) as bits 0-9, Enter as bit 10, the
+ * major.minor separator (. or -) as bit 11. */
 static uint32_t read_keys(retro_input_state_t cb)
 {
    uint32_t bits = 0;
@@ -57,6 +58,9 @@ static uint32_t read_keys(retro_input_state_t cb)
          bits |= 1u << d;
    if (cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_RETURN) || cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP_ENTER))
       bits |= 1u << 10;
+   if (cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_PERIOD) || cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP_PERIOD) ||
+       cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_MINUS) || cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP_MINUS))
+      bits |= 1u << 11;
    return bits;
 }
 
@@ -108,9 +112,9 @@ unsigned xs_input_poll(xs_input_t *in, retro_input_state_t state_cb, double fps,
       if (map[i].repeat && ((bits >> map[i].id) & 1))
          *zapping = true;
    }
-   for (i = 0; i < 11 && n < XS_MAX_ACTIONS; i++)
+   for (i = 0; i < 12 && n < XS_MAX_ACTIONS; i++)
       if (((keys >> i) & 1) && !((in->keys_prev >> i) & 1))
-         acts[n++] = i < 10 ? XS_ACT_DIGIT0 + i : XS_ACT_ENTER;
+         acts[n++] = i < 10 ? XS_ACT_DIGIT0 + i : i == 10 ? XS_ACT_ENTER : XS_ACT_DOT;
    in->prev = bits;
    in->keys_prev = keys;
    return n;

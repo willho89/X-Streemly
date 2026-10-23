@@ -298,7 +298,8 @@ IPTV=$FIX/iptv-fake
 mkdir -p "$IPTV/countries" "$IPTV/languages"
 sed -e "s|@HTTPS@|$HTTPS|" -e "s|@HTTP@|$HTTP|" tests/fixtures/iptv_uk.m3u.in > "$IPTV/countries/uk.m3u"
 sed -e "s|@HTTPS@|$HTTPS|" -e "s|@HTTP@|$HTTP|" tests/fixtures/iptv_eng.m3u.in > "$IPTV/languages/eng.m3u"
-FAKE="XSTREEMLY_IPTV_BASE=$HTTPS/iptv-fake/ XSTREEMLY_CA_FILE=$FIX/tls/cert.pem"
+# Lineup pinned to iptv-org: Auto would look for (and find) real HDHomeRuns on the LAN.
+FAKE="XSTREEMLY_IPTV_BASE=$HTTPS/iptv-fake/ XSTREEMLY_CA_FILE=$FIX/tls/cert.pem HARNESS_OPT_xstreemly_source=iptv"
 fresh_lineup
 
 run iptv_start - 900 $FAKE
@@ -315,7 +316,7 @@ expect 'countries/uk.m3u from the cache'
 expect_no 'channel 1: Dead News'
 ok "cached list; starts past the channel known to be dead"
 
-run iptv_offline - 600 XSTREEMLY_IPTV_BASE=https://127.0.0.1:1/ HARNESS_OPT_xstreemly_refresh=0
+run iptv_offline - 600 XSTREEMLY_IPTV_BASE=https://127.0.0.1:1/ HARNESS_OPT_xstreemly_refresh=0 HARNESS_OPT_xstreemly_source=iptv
 expect 'using the cached list'
 expect 'picture .* after tune'
 ok "offline: the cached list, however old"
@@ -335,7 +336,7 @@ expect 'channel 2: Fixture News'
 ok "X marks a favourite (saved), Y goes back to it"
 
 fresh_lineup
-run iptv_verify - 120 XSTREEMLY_IPTV_BASE=$HTTPS/iptv-fake/
+run iptv_verify - 120 XSTREEMLY_IPTV_BASE=$HTTPS/iptv-fake/ HARNESS_OPT_xstreemly_source=iptv
 expect 'lineup: countries/uk.m3u: '
 expect 'OSD: Channel list: '
 ok "TLS is checked: the self-signed test server is refused without its certificate"
@@ -363,6 +364,42 @@ expect 'channel list .*: 7 channel'
 expect 'lineup: 7 channel'
 ok "a .strm naming a channel list loads it (unfiltered, as the user's own)"
 
+echo "== M3b: HDHomeRun (a fake one on the test server)"
+
+HDHR=$FIX/hdhr-fake
+mkdir -p "$HDHR"
+sed -e "s|@HTTPS@|$HTTPS|" -e "s|@HTTP@|$HTTP|" tests/fixtures/hdhr_discover.json.in > "$HDHR/discover.json"
+sed -e "s|@HTTPS@|$HTTPS|" -e "s|@HTTP@|$HTTP|" tests/fixtures/hdhr_lineup.json.in > "$HDHR/lineup.json"
+TUNER="XSTREEMLY_HDHR=$HTTP/hdhr-fake HARNESS_OPT_xstreemly_source=hdhomerun"
+fresh_lineup
+
+run hdhr "-" 900 $TUNER HARNESS_DEBUG=1 HARNESS_INPUT="300:K3,304:KDOT,308:K2,500:UP"
+expect 'hdhomerun: HDHomeRun FAKE at .*hdhr-fake, 2 tuners'
+expect 'hdhomerun: 5 channels from HDHomeRun FAKE \(2 can.t be played'
+expect 'channel 8.1: "FAKE DRM" group "Local TV" .* DRM'
+expect 'channel 8.2: "FAKE AC4" .* no-codec'
+expect 'channel 3.1: FAKE-HD'
+expect 'channel 3.2: FAKE SD'
+expect 'channel 49.10: BUSY'
+expect_no 'channel 8.[12]: FAKE'
+expect_no 'is dead'
+expect 'picture .* after tune'
+check_common
+ok "discover.json + lineup.json: 3.1 / 3.2 / 49.10 numbers, typed 3.2, Up skips DRM and AC-4, a busy tuner isn't 'dead'"
+
+fresh_lineup
+run hdhr_both "-" 300 XSTREEMLY_HDHR=$HTTP/hdhr-fake HARNESS_OPT_xstreemly_source=both XSTREEMLY_IPTV_BASE=$HTTPS/iptv-fake/ XSTREEMLY_CA_FILE=$FIX/tls/cert.pem HARNESS_DEBUG=1
+expect 'channel 3.1: "FAKE-HD"'
+expect 'channel 1001: "Dead News"'
+expect 'lineup: 10 channel'
+ok "HDHomeRun + iptv-org: local channels first, iptv-org from 1001"
+
+fresh_lineup
+run hdhr_auto_none "-" 300 XSTREEMLY_HDHR=http://127.0.0.1:1 HARNESS_OPT_xstreemly_source=hdhomerun
+expect 'OSD: Channel list: '
+check_common
+ok "HDHomeRun chosen but unreachable: NO CHANNELS card"
+
 echo "== failures never block the frontend"
 
 run http_404 "$HTTPS/_status/404/hls2/master.m3u8" 60
@@ -377,7 +414,7 @@ check_common
 ok "unload while connecting: $(awk '/^unload_ms/{print $2}' "$LOG") ms"
 
 fresh_lineup
-run no_content - 120 XSTREEMLY_IPTV_BASE=https://127.0.0.1:1/
+run no_content - 120 XSTREEMLY_IPTV_BASE=https://127.0.0.1:1/ HARNESS_OPT_xstreemly_source=iptv
 expect 'lineup: countries/uk.m3u: '
 expect 'OSD: Channel list: '
 check_common
