@@ -22,6 +22,7 @@ env:
 
 jobs:
   linux-x86_64:
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +31,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q nasm pkg-config ffmpeg openssl python3 zip
+          sudo apt-get install -y -q --no-install-recommends -o Acquire::Retries=3 nasm pkg-config ffmpeg openssl python3 zip
       - name: Dependency cache key
         id: deps
         run: echo "key=$(git submodule status | sha1sum | cut -c1-16)-${{ hashFiles('Makefile', 'Makefile.deps') }}" >> "$GITHUB_OUTPUT"
@@ -63,6 +64,7 @@ jobs:
           path: build/check
 
   windows-x86_64:
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
     needs: linux-x86_64
     steps:
@@ -78,7 +80,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q nasm pkg-config python3 zip mingw-w64 wine64
+          sudo apt-get install -y -q --no-install-recommends -o Acquire::Retries=3 nasm pkg-config python3 zip gcc-mingw-w64-x86-64-posix wine wine64
       - name: Dependency cache key
         id: deps
         run: echo "key=$(git submodule status | sha1sum | cut -c1-16)-${{ hashFiles('Makefile', 'Makefile.deps') }}" >> "$GITHUB_OUTPUT"
@@ -103,6 +105,7 @@ jobs:
           path: build/win64/check
 
   cross:
+    timeout-minutes: 45
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -123,7 +126,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q pkg-config zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+          sudo apt-get install -y -q --no-install-recommends -o Acquire::Retries=3 pkg-config zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
       - name: Dependency cache key
         id: deps
         run: echo "key=$(git submodule status | sha1sum | cut -c1-16)-${{ hashFiles('Makefile', 'Makefile.deps') }}" >> "$GITHUB_OUTPUT"
@@ -148,6 +151,7 @@ jobs:
           path: build/package/*.zip
 
   macos:
+    timeout-minutes: 60
     needs: linux-x86_64
     strategy:
       fail-fast: false
@@ -199,6 +203,7 @@ jobs:
   # source archive (GitHub's own source zips leave out the submodules, and
   # the GPL wants the bundled libraries' source next to the binaries).
   release:
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux-x86_64, windows-x86_64, cross, macos]
     runs-on: ubuntu-24.04

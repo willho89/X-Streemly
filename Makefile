@@ -46,6 +46,8 @@ else ifeq ($(platform),osx)
   SHARED    := -dynamiclib -Wl,-exported_symbol,_retro_*
   BUILD_DIR ?= build/osx
   HOST_LIBS := -lpthread
+  # _POSIX_C_SOURCE (below) hides the BSD types Apple's own headers use.
+  CPPFLAGS  += -D_DARWIN_C_SOURCE
   MACOSX_DEPLOYMENT_TARGET ?= 11.0
   export MACOSX_DEPLOYMENT_TARGET
 else ifeq ($(platform),win)
