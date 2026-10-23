@@ -40,14 +40,32 @@ bool xs_aring_write(xs_aring_t *r, unsigned serial, const int16_t *pcm, unsigned
 int64_t  xs_aring_level_us(xs_aring_t *r, unsigned serial);
 /* Timestamp of the next unread sample. False if empty. */
 bool     xs_aring_clock(xs_aring_t *r, unsigned serial, int64_t *clock_us);
-/* Read up to frames stereo frames; returns how many were read. */
-unsigned xs_aring_read(xs_aring_t *r, unsigned serial, int16_t *out, unsigned frames);
+/* Read up to frames stereo frames; returns how many were read. *jump is
+ * set to the first frame where the timestamps jump (a gap or overlap of
+ * more than a few ms between chunks: a reconnect or a join), or -1. */
+unsigned xs_aring_read(xs_aring_t *r, unsigned serial, int16_t *out, unsigned frames, int *jump);
+/* Drop everything before pts_us (keeping the ring in step with another
+ * one being played: the other audio tracks). */
+void     xs_aring_discard_until(xs_aring_t *r, unsigned serial, int64_t pts_us);
 /* Drop about us of the oldest audio (whole chunks); returns what was dropped. */
 int64_t  xs_aring_skip(xs_aring_t *r, unsigned serial, int64_t us);
 
 /* Playback speed the presenter wants (1.0 = nominal, >1 drains the buffer). */
 void   xs_aring_set_ratio(xs_aring_t *r, double ratio);
 double xs_aring_ratio(xs_aring_t *r);
+
+/* Loudness levelling (§5.6): a slow gain that brings each channel to about
+ * the same loudness, with a limiter. Gated, so quiet passages and silence
+ * aren't pumped up. */
+typedef struct
+{
+   double ms;        /* smoothed mean square of the loud enough ticks */
+   double gain;      /* applied now */
+   double settle_s;  /* time since reset, for a quick first estimate */
+} xs_agc_t;
+
+void xs_agc_reset(xs_agc_t *a);
+void xs_agc_process(xs_agc_t *a, int16_t *stereo, unsigned frames, unsigned rate);
 
 typedef struct xs_adec xs_adec_t;
 

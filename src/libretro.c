@@ -190,6 +190,7 @@ static void show_message(unsigned ms, bool alert, const char *fmt, ...)
 static struct retro_core_option_v2_category g_opt_categories[] = {
    { "iptv", "Channels", "The lineup used when the core starts without content: an HDHomeRun tuner and/or iptv-org." },
    { "video", "Video", "Resolution and deinterlacing." },
+   { "audio", "Audio", "Audio track and loudness." },
    { "advanced", "Advanced", "Buffering and logging." },
    { NULL, NULL, NULL },
 };
@@ -273,6 +274,22 @@ static struct retro_core_option_v2_definition g_opt_defs[] = {
       "24"
    },
    {
+      "xstreemly_audio_language", "Audio Language", NULL,
+      "Which audio track to start with when a channel has several (second languages, audio "
+      "description). L2 switches tracks while watching.",
+      NULL, "audio",
+      { XS_IPTV_LANGUAGE_VALUES },
+      "any"
+   },
+   {
+      "xstreemly_level_audio", "Volume Levelling", NULL,
+      "Bring every channel to about the same loudness, so changing channel doesn't blast or "
+      "whisper. Quiet scenes stay quiet.",
+      NULL, "audio",
+      { { "off", "Off" }, { "on", "On" }, { NULL, NULL } },
+      "off"
+   },
+   {
       "xstreemly_buffer", "Buffer", NULL,
       "How much to buffer before playing, and the least kept while playing. More rides out a "
       "shaky connection; less starts sooner.",
@@ -348,8 +365,14 @@ static void read_options(xs_ctx_t *ctx)
    if (ctx->opt.buffer_ms < 200 || ctx->opt.buffer_ms > 10000)
       ctx->opt.buffer_ms = 1000;
 
+   v = get_option("xstreemly_level_audio");
+   ctx->opt.level_audio = v && !strcmp(v, "on");
+   v = get_option("xstreemly_audio_language");
+   snprintf(ctx->opt.audio_lang, sizeof(ctx->opt.audio_lang), "%s", v && strcmp(v, "any") ? v : "");
+
    if (ctx->tuner)
    {
+      xs_tuner_set_audio_lang(ctx->tuner, ctx->opt.audio_lang);
       xs_tuner_set_max_height(ctx->tuner, ctx->opt.max_height);
       xs_video_set_options(xs_tuner_video(ctx->tuner), ctx->opt.deint, ctx->opt.max_height);
    }

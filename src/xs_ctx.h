@@ -32,6 +32,8 @@ typedef struct
    xs_deint_t deint;
    unsigned   buffer_ms;      /* start / steady-state buffer target */
    bool       osd;            /* in-picture cards and messages */
+   char       audio_lang[8];  /* preferred audio track language, "" = stream default */
+   bool       level_audio;    /* loudness levelling (§5.6) */
 } xs_options_t;
 
 typedef struct

@@ -6,7 +6,7 @@
 import socket, struct, sys, time
 
 IDS = {"B": 0, "Y": 1, "SELECT": 2, "START": 3, "UP": 4, "DOWN": 5, "LEFT": 6, "RIGHT": 7,
-       "A": 8, "X": 9, "L": 10, "R": 11}
+       "A": 8, "X": 9, "L": 10, "R": 11, "L2": 12, "R2": 13}
 RETRO_DEVICE_JOYPAD = 1
 
 def send(sock, port, button, state):

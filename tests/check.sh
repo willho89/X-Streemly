@@ -400,6 +400,76 @@ expect 'OSD: Channel list: '
 check_common
 ok "HDHomeRun chosen but unreachable: NO CHANNELS card"
 
+echo "== M4: robustness (changes mid-stream, bad networks, audio tracks)"
+
+run format_change "$HTTPS/hls_change/live.m3u8" 1500 HARNESS_AVSYNC=1
+expect 'geometry 1280x720 '
+expect 'geometry 1920x1080 '
+expect_no 'audio underrun'
+check_common
+check_avsync 20 40
+ok "720p stereo -> 1080p 5.1 at a discontinuity and back, no re-buffer; $AVS"
+
+run pts_wrap "$HTTPS/wrap.ts" 780 HARNESS_AVSYNC=1
+expect 'end of stream'
+expect_no 're-buffering'
+check_common
+check_avsync 11 40
+shown=$(grep -oE 'shown [0-9]+' "$LOG" | tail -1 | cut -d' ' -f2)
+[ "$shown" -ge 290 ] || fail "only $shown of 300 pictures shown across the wrap"
+ok "33-bit PTS wrap mid-file: $shown pictures, $AVS"
+
+run step_down "$HTTPS/_throttle/v1080/150/hls2/master.m3u8" 3000 HARNESS_AVSYNC=1
+expect 'two stalls within 60 s: asking for a lower variant'
+expect 'variant: 1080p can.t keep up, stepping down'
+expect 'variant: program 0, 1280x720'
+check_common
+check_avsync 30 120
+under=$(grep -c 'audio underrun' "$LOG")
+[ "$under" -le 2 ] || fail "$under underruns: still starving after the step down"
+ok "1080p starved: steps down to 720p after two stalls, then plays ($under underruns); $AVS"
+
+run drop_every "$HTTPS/_dropevery/5/hls2/master.m3u8" 2400 HARNESS_AVSYNC=1
+expect_no 'Signal lost'
+check_common
+check_avsync 30 50
+ok "every 5th request dropped mid-body: plays through; $AVS"
+
+run outage "$HTTPS/_outage/15/8/hls2/master.m3u8" 2700 HARNESS_AVSYNC=1
+expect 'Signal lost'
+expect 'timeline: reconnected, joined at'
+expect 'resumed after'
+check_common
+check_avsync 30 50
+ok "8 s server outage: reconnects and rejoins the live edge; $AVS"
+
+run audio_lang "$HTTPS/tracks.ts" 300 HARNESS_OPT_xstreemly_audio_language=spa
+expect 'audio: 3 tracks, starting with 2 \(spa\)'
+check_common
+ok "Audio Language option picks the Spanish track"
+
+run audio_switch "$HTTPS/hls_tracks/live.m3u8" 1200 HARNESS_DEBUG=1 HARNESS_INPUT="400:L2,800:L2" HARNESS_WAV=$WORK/audio_switch.wav
+expect 'audio: 3 tracks, starting with 1 \(eng\)'
+expect 'audio: track 2 of 3'
+expect 'audio: track 3 of 3'
+expect 'note: AUDIO 2/3 spa'
+expect_no 'audio underrun'
+check_common
+# L2 at 6.67 s and 13.33 s: the very next beep is the new track's
+python3 -I tests/tone.py "$WORK/audio_switch.wav" > "$WORK/audio_switch.beeps"
+awk 'function bad(want) { d = $2 - want; return d < -want / 20 || d > want / 20 }
+     $1 < 6.6 && bad(1000) || $1 > 6.8 && $1 < 13.2 && bad(500) || $1 > 13.4 && bad(2000) { print; e = 1 }
+     END { exit e || NR < 15 }' "$WORK/audio_switch.beeps" || { LOG=$WORK/audio_switch.beeps; fail "wrong beeps"; }
+ok "L2 switches tracks at once: 1 kHz -> 500 Hz -> 2 kHz from the next beep"
+
+run level_audio "$HTTPS/hls_tracks/live.m3u8" 900 HARNESS_OPT_xstreemly_level_audio=on HARNESS_AVSYNC=1 HARNESS_WAV=$WORK/level_audio.wav
+check_common
+check_avsync 12 40
+python3 -I tests/tone.py "$WORK/level_audio.wav" > "$WORK/level_audio.beeps"
+lvl=$(tail -5 "$WORK/level_audio.beeps" | awk '{s += $3} END {printf "%.1f", s / NR}')
+awk -v l="$lvl" 'BEGIN { exit !(l > -21 && l < -16) }' || fail "beeps at $lvl dBFS after levelling (fixture: -23)"
+ok "Volume Levelling: -23 dBFS beeps brought to $lvl dBFS, no clicks"
+
 echo "== failures never block the frontend"
 
 run http_404 "$HTTPS/_status/404/hls2/master.m3u8" 60

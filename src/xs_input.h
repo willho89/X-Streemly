@@ -28,6 +28,7 @@ typedef enum
    XS_ACT_FAV,          /* X: favourite on/off */
    XS_ACT_NEXT_FAV,     /* Y: next favourite */
    XS_ACT_DOT,          /* keyboard . or -: major.minor channel numbers */
+   XS_ACT_AUDIO,        /* L2: next audio track */
    XS_ACT_DIGIT0        /* + 0..9: keyboard digits */
 } xs_action_t;
 

@@ -47,6 +47,11 @@ bool xs_present_has_picture(const xs_present_t *p);
 /* The last tick showed a card (tuning, no signal ...), not the stream. */
 bool xs_present_card_showing(const xs_present_t *p);
 
+/* Play the stream's next audio track (instant: all are decoded). */
+void xs_present_next_audio(xs_present_t *p);
+/* The track played (0-based), and how many there are. */
+unsigned xs_present_audio_track(const xs_present_t *p, unsigned *tracks);
+
 /* Log a summary line (also done every minute while playing). */
 void xs_present_log_stats(xs_present_t *p);
 

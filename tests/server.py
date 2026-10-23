@@ -23,6 +23,15 @@
 #   /_gap/<n>/...       live.m3u8 skips one segment of content after every
 #                       n-th, numbering unchanged and no discontinuity tag:
 #                       a timestamp gap, as when segments expired unread
+#   /_throttle/<text>/<KBps>/... send at most KBps for paths containing text
+#                       (starve one HLS variant)
+#   /_dropevery/<n>/... every n-th request under this prefix sends headers and
+#                       half the body, then closes (connections dying mid-segment)
+#   /_outage/<start_s>/<dur_s>/... from start_s after the first such request, for
+#                       dur_s, close every connection without an answer
+#                       (a server that goes away and comes back)
+# A vod.m3u8 may carry #EXT-X-DISCONTINUITY lines (a format change mid-stream);
+# live.m3u8 keeps them.
 import argparse
 import os
 import re
@@ -35,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WINDOW = 6
 START = time.monotonic()
+OUTAGE_FIRST = {}   # /_outage/<start>/<dur>: when its first request came
 HICCUPS = {}
 HICCUP_LOCK = threading.Lock()
 
@@ -50,25 +60,27 @@ TYPES = {
 
 
 def parse_vod(path):
-    """[(duration, uri)], target duration of a VOD media playlist."""
-    segs, dur, target = [], None, 2
+    """[(duration, uri, discontinuity before it)], target duration of a VOD media playlist."""
+    segs, dur, target, disc = [], None, 2, False
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line.startswith("#EXT-X-TARGETDURATION:"):
                 target = int(line.split(":", 1)[1])
+            elif line == "#EXT-X-DISCONTINUITY":
+                disc = True
             elif line.startswith("#EXTINF:"):
                 dur = float(line[8:].split(",", 1)[0])
             elif line and not line.startswith("#") and dur is not None:
-                segs.append((dur, line))
-                dur = None
+                segs.append((dur, line, disc))
+                dur, disc = None, False
     return segs, target
 
 
 def live_playlist(vod_path, gap=0):
     segs, target = parse_vod(vod_path)
     n = len(segs)
-    total = sum(d for d, _ in segs)
+    total = sum(s[0] for s in segs)
     elapsed = time.monotonic() - START
     loops, rem = divmod(elapsed, total)
     i = 0
@@ -86,9 +98,9 @@ def live_playlist(vod_path, gap=0):
         return a + (a // gap if gap else 0)
     for a in range(first, newest + 1):
         c = content(a)
-        if a > 0 and c // n != content(a - 1) // n:   # the loop wrapped
+        d, uri, disc = segs[c % n]
+        if (a > 0 and c // n != content(a - 1) // n) or disc:   # the loop wrapped, or the vod says so
             out.append("#EXT-X-DISCONTINUITY")
-        d, uri = segs[c % n]
         out.append(f"#EXTINF:{d:.6f},")
         out.append(uri)
     return ("\n".join(out) + "\n").encode()
@@ -114,7 +126,34 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         stall = drop = None
         gap = 0
+        throttle = None
         while True:
+            t = re.match(r"^/_throttle/([^/]+)/(\d+)(/.*)$", path)
+            if t:
+                if t.group(1) in t.group(3):
+                    throttle = int(t.group(2)) * 1024
+                path = t.group(3)
+                continue
+            dv = re.match(r"^/_dropevery/(\d+)(/.*)$", path)
+            if dv:
+                every, path = int(dv.group(1)), dv.group(2)
+                with HICCUP_LOCK:
+                    n = HICCUPS.get(("drop", every), 0) + 1
+                    HICCUPS[("drop", every)] = n
+                if n % every == 0 and not path.endswith(".m3u8"):
+                    print(f"DROP {path}", flush=True)
+                    drop = True
+                continue
+            o = re.match(r"^/_outage/(\d+)/(\d+)(/.*)$", path)
+            if o:
+                start, dur, path = int(o.group(1)), int(o.group(2)), o.group(3)
+                first = OUTAGE_FIRST.setdefault((start, dur), time.monotonic())
+                if start <= time.monotonic() - first < start + dur:
+                    print(f"OUTAGE {path}", flush=True)
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    return
+                continue
             g = re.match(r"^/_gap/(\d+)(/.*)$", path)
             if g:
                 gap, path = int(g.group(1)), g.group(2)
@@ -171,6 +210,12 @@ class Handler(BaseHTTPRequestHandler):
         if head:
             return
         try:
+            if throttle:
+                for i in range(0, len(body), 8192):
+                    self.wfile.write(body[i:i + 8192])
+                    self.wfile.flush()
+                    time.sleep(8192 / throttle)
+                return
             if stall is not None or drop:
                 half = len(body) // 2
                 self.wfile.write(body[:half])

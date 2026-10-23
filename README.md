@@ -4,7 +4,7 @@ A [libretro](https://www.libretro.com/) core for **network video**: tune in to l
 channels on a TV. Developed and tested in RetroArch; support for [VRT](https://github.com/willho89/VRT) (an
 emulated CRT TV for Meta Quest) comes later.
 
-> **Status: early development (M3 done).** Start the core in RetroArch with no content and it shows the channels of
+> **Status: early development (M4 done).** Start the core in RetroArch with no content and it shows the channels of
 > an HDHomeRun tuner on your network, or iptv-org's free channels for your country; or load your own M3U list. No
 > release yet.
 
@@ -17,9 +17,14 @@ emulated CRT TV for Meta Quest) comes later.
 - **Smooth on any display:** frames are shown by their timestamps at the display's rate; a small, inaudible rate
   correction keeps the buffer steady whatever the broadcaster's clock does.
 - **Rides out a bad connection:** holds the picture through a stall, re-buffers, reconnects without losing what's
-  buffered, and learns a bigger buffer for streams that need one.
+  buffered, learns a bigger buffer for streams that need one, and drops to a lower HLS quality if the connection
+  can't keep up. Changes mid-stream (resolution, 5.1 ↔ stereo, ad breaks) and timestamp wraps play straight
+  through.
+- **Audio tracks:** second languages and audio description; the *Audio Language* option picks one to start with,
+  L2 switches instantly while watching. Optional *Volume Levelling* evens out loudness between channels.
 - **TV out of the box:** with no content, the channels of an **HDHomeRun** network tuner if one is on the LAN (found
-  automatically; ATSC channels numbered 3.1, 3.2 …), else **iptv-org**'s free public channels, filtered by country,
+  automatically; ATSC channels numbered 3.1, 3.2 …), else [iptv-org](https://github.com/iptv-org/iptv)'s free
+  public channels (a community collection; X-Streemly hosts no streams), filtered by country,
   category and language, cached for offline use. Channels that don't answer are skipped for a day.
 - **Channel lists:** M3U/M3U8 playlists, local or at a URL, numbered in order or by `tvg-chno`; encrypted (DRM)
   channels are recognised and skipped.
@@ -45,12 +50,11 @@ https://example.com/live/channel/playlist.m3u8
 | A | Info |
 | Select | Channel list (Up/Down, A to tune, B to close) |
 | X / Y | Favourite on/off / next favourite |
+| L2 | Next audio track |
 | Keyboard 0–9 (and . for 3.1) | Channel number |
 
 ## Planned
-- **Free IPTV out of the box:** channel lists from [iptv-org](https://github.com/iptv-org/iptv), a community
-  collection of publicly available TV streams, browsable by country, category and language. X-Streemly hosts no
-  streams.
+- **Releases:** builds for Linux, Windows, macOS and Android.
 - **VRT:** standard-definition output and interlaced streams sent field by field to VRT's virtual CRT.
 - **Later:** a companion app for Linux and Windows that casts a low-resolution virtual monitor (an app, a video
   player…) to X-Streemly over the network.

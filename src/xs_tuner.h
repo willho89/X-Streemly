@@ -22,6 +22,9 @@
 #include "xs_source.h"
 #include "xs_video.h"
 
+/* Audio tracks decoded at once, so switching is instant (§M4). */
+#define XS_MAX_TRACKS 4
+
 typedef enum
 {
    XS_TUNER_IDLE = 0,
@@ -39,6 +42,12 @@ typedef struct
    char     msg[256];     /* PLAYING: stream summary; FAILED: reason */
    bool     has_audio, has_video;
    bool     live;
+   unsigned height;         /* the chosen video's height */
+   bool     can_step_down;  /* a lower HLS variant exists */
+   unsigned audio_tracks;   /* decoded audio tracks, each into its own ring */
+   unsigned audio_default;  /* the one to start with (Audio Language option) */
+   char     audio_lang[XS_MAX_TRACKS][8];   /* language tags ("eng"), "" if none */
+   bool     audio_described[XS_MAX_TRACKS];
    uint64_t packets;
    uint64_t bytes;
 } xs_tuner_status_t;
@@ -53,8 +62,15 @@ void xs_tuner_stop(xs_tuner_t *t);
 void xs_tuner_get_status(xs_tuner_t *t, xs_tuner_status_t *out);
 /* Variant choice and output cap (0 = native); applies from the next open. */
 void xs_tuner_set_max_height(xs_tuner_t *t, unsigned max_height);
+/* Preferred audio language (ISO 639 code, "" = the stream's default),
+ * from the next open. */
+void xs_tuner_set_audio_lang(xs_tuner_t *t, const char *lang);
+/* The chosen HLS variant can't keep up: reopen with the next lower one,
+ * keeping what is buffered (a reconnect). Ignored if there is none. */
+void xs_tuner_step_down(xs_tuner_t *t);
 
-xs_aring_t *xs_tuner_aring(xs_tuner_t *t);
+/* The ring of audio track i (0 .. status.audio_tracks - 1). */
+xs_aring_t *xs_tuner_aring(xs_tuner_t *t, unsigned i);
 xs_video_t *xs_tuner_video(xs_tuner_t *t);
 
 #endif

@@ -19,6 +19,10 @@
 #   p2997.ts    1080p29.97 H.264 + AC-3, 10 s
 #   p50.ts      720p50 H.264 + AAC, 10 s
 #   hevc.ts     720p25 HEVC + E-AC-3, 6 s
+#   hls_change/ live HLS: 720p + stereo AC-3, then (discontinuity) 1080p + 5.1 AC-3
+#   wrap.ts     timestamps that wrap at 2^33 (26.5 h) 2.5 s in
+#   tracks.ts   three audio tracks with language tags (eng, spa, eng described video)
+#   hls_tracks/ the same as live HLS
 #   parser_*.m3u  channel lists that exercise the M3U parser
 #   tls/        self-signed certificate for localhost (server.py --tls)
 set -eu
@@ -88,6 +92,41 @@ echo "== hevc.ts (720p25 HEVC + E-AC-3)"
 $FF -f lavfi -i "$(video 1280x720 25 6)" -f lavfi -i "$(audio 6)" \
    -c:v libx265 -preset ultrafast -x265-params log-level=error -pix_fmt yuv420p -g 25 \
    -c:a eac3 -b:a 192k -f mpegts "$OUT/hevc.ts"
+
+echo "== hls_change (live HLS: 720p + stereo AC-3, discontinuity, 1080p + 5.1 AC-3)"
+mkdir -p "$OUT/hls_change"
+$FF -f lavfi -i "$(video 1280x720 25 10)" -f lavfi -i "$(audio 10)" \
+   $X264 -b:v 2M -g 50 -keyint_min 50 -sc_threshold 0 -c:a ac3 -b:a 192k \
+   -f hls -hls_time 2 -hls_playlist_type vod \
+   -hls_segment_filename "$OUT/hls_change/a_%03d.ts" "$OUT/hls_change/a.m3u8"
+$FF -f lavfi -i "$(video 1920x1080 25 10)" \
+   -f lavfi -i "$(audio 10 | sed 's/|/|/')" -filter_complex "[1:a]pan=5.1|FL=c0|FR=c1|FC=c0|LFE=0*c0|BL=0.5*c0|BR=0.5*c1[a]" \
+   -map 0:v -map "[a]" $X264 -b:v 4M -g 50 -keyint_min 50 -sc_threshold 0 -c:a ac3 -b:a 384k \
+   -f hls -hls_time 2 -hls_playlist_type vod \
+   -hls_segment_filename "$OUT/hls_change/b_%03d.ts" "$OUT/hls_change/b.m3u8"
+{ sed -n '1,/^#EXT-X-MEDIA-SEQUENCE/p' "$OUT/hls_change/a.m3u8"
+  grep -E '^(#EXTINF|a_)' "$OUT/hls_change/a.m3u8"
+  echo "#EXT-X-DISCONTINUITY"
+  grep -E '^(#EXTINF|b_)' "$OUT/hls_change/b.m3u8"
+  echo "#EXT-X-ENDLIST"; } > "$OUT/hls_change/vod.m3u8"
+
+echo "== wrap.ts (720p25 H.264 + AAC whose timestamps wrap at 2^33 after ~2.5 s)"
+$FF -f lavfi -i "$(video 1280x720 25 12)" -f lavfi -i "$(audio 12)" \
+   $X264 -b:v 2M -g 25 -c:a aac -b:a 128k -output_ts_offset 95441.2 -f mpegts "$OUT/wrap.ts"
+
+echo "== tracks.ts (3 audio tracks: eng 1 kHz, spa 500 Hz, eng described video 2 kHz)"
+tone() { # seconds hz
+   echo "aevalsrc='if(lt(mod(t\,1)\,0.1)\,0.1*sin(2*PI*$2*t)\,0)|if(lt(mod(t\,1)\,0.1)\,0.1*sin(2*PI*$2*t)\,0)':s=48000:d=$1"
+}
+$FF -f lavfi -i "$(video 1280x720 25 10)" -f lavfi -i "$(tone 10 1000)" -f lavfi -i "$(tone 10 500)" -f lavfi -i "$(tone 10 2000)" \
+   -map 0:v -map 1:a -map 2:a -map 3:a $X264 -b:v 2M -g 25 -c:a aac -b:a 128k \
+   -metadata:s:a:0 language=eng -metadata:s:a:1 language=spa -metadata:s:a:2 language=eng \
+   -disposition:a:0 default -disposition:a:2 visual_impaired -f mpegts "$OUT/tracks.ts"
+
+echo "== hls_tracks (live HLS with the same three audio tracks)"
+mkdir -p "$OUT/hls_tracks"
+$FF -i "$OUT/tracks.ts" -map 0 -c copy -f hls -hls_time 2 -hls_playlist_type vod \
+   -hls_segment_filename "$OUT/hls_tracks/seg_%03d.ts" "$OUT/hls_tracks/vod.m3u8"
 
 echo "== playlists for the parser (BOM + CRLF + quoted commas; Latin-1; relative entries)"
 printf '\357\273\277#EXTM3U x-tvg-url="http://example.com/epg.xml"\r\n' > "$OUT/parser_utf8.m3u"

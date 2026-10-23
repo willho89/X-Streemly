@@ -105,6 +105,7 @@ void xs_tv_set_lineup(xs_tv_t *tv, xs_chan_t *chan)
 static void note(xs_tv_t *tv, const char *msg)
 {
    snprintf(tv->note, sizeof(tv->note), "%s", msg);
+   XS_DEBUG(tv->ctx, "note: %s\n", msg);
    tv->note_until = after_ms(tv, XS_NOTE_MS);
 }
 
@@ -301,6 +302,25 @@ static void handle(xs_tv_t *tv, unsigned act, unsigned rows)
          tv->banner_idx   = tv->chan.cur;
          tv->banner_until = after_ms(tv, XS_NOTE_MS);
          break;
+      case XS_ACT_AUDIO:
+      {
+         xs_tuner_status_t st;
+         unsigned n, k;
+         xs_tuner_get_status(tv->tuner, &st);
+         xs_present_next_audio(tv->present);
+         k = xs_present_audio_track(tv->present, &n);
+         if (n > 1 && k < XS_MAX_TRACKS)
+         {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "AUDIO %u/%u %s%s", k + 1, n,
+                     st.audio_lang[k][0] ? st.audio_lang[k] : "",
+                     st.audio_described[k] ? " (DESCRIBED)" : "");
+            note(tv, msg);
+         }
+         else
+            note(tv, n ? "ONE AUDIO TRACK" : "NO AUDIO");
+         break;
+      }
       case XS_ACT_NEXT_FAV:
       {
          unsigned f = xs_chan_next_fav(&tv->chan, base);
@@ -379,8 +399,12 @@ static void build_overlay(xs_tv_t *tv, unsigned pic_h)
       snprintf(ov.info_line[1], sizeof(ov.info_line[1]), "%s%s%s", c->group,
                c->flags & XS_CH_GEOBLOCKED ? "  GEO-BLOCKED" : "",
                c->flags & XS_CH_NOT_247 ? "  NOT 24/7" : "");
-      snprintf(ov.info_line[2], sizeof(ov.info_line[2]), "%s",
-               st.state == XS_TUNER_PLAYING ? st.msg : "");
+      unsigned ntr, trk = xs_present_audio_track(tv->present, &ntr);
+      if (st.state == XS_TUNER_PLAYING && ntr > 1 && trk < XS_MAX_TRACKS)
+         snprintf(ov.info_line[2], sizeof(ov.info_line[2]), "%.200s  AUDIO %u/%u %s", st.msg,
+                  trk + 1, ntr, st.audio_lang[trk]);
+      else
+         snprintf(ov.info_line[2], sizeof(ov.info_line[2]), "%s", st.state == XS_TUNER_PLAYING ? st.msg : "");
       snprintf(ov.info_line[3], sizeof(ov.info_line[3]), "%s", state_text(&st));
       if (!ov.info_line[1][0])
       {

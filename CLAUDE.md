@@ -186,9 +186,12 @@ opens URLs.
   `discard = AVDISCARD_ALL` on every other program's streams, so FFmpeg's hls demuxer downloads only the chosen one.
   Verify with a 2-variant fixture in M1.
 - No adaptive switching in v1 (FFmpeg's hls demuxer has none). If the chosen variant can't keep the buffer filled
-  (repeated stalls), retune to the next variant down (M4).
-- Audio: first stream of the chosen program, preferring the playlist/`tvg-language` language when there are several
-  (M4).
+  (two underruns within 60 s on a live stream), the tuner reconnects with the next variant down, keeping the serial
+  and what is buffered (D-033).
+- Audio: every decodable audio stream of the chosen program (up to 4) is decoded, each into its own ring; the
+  *Audio Language* option picks the one to start with (else the stream's default, avoiding audio description), and
+  L2 switches the ring the presenter reads, at the same timestamp: instant (D-035). The rings not played are trimmed
+  to the clock every tick.
 
 ### 5.4 Video (xs_video.c) — D-005
 - Decoders: `h264`, `hevc`, `mpeg2video`, `mpeg1video`, frame + slice threading with **half the CPUs**; swscale and the
@@ -249,8 +252,10 @@ opens URLs.
 ### 5.6 Audio (xs_audio.c)
 - Decoders: `aac`, `aac_latm`, `mp2`, `mp3`, `ac3`, `eac3`. AC-3/E-AC-3 downmix in the decoder (DeeVee D-014);
   swresample for the rest with `rematrix_maxval=1`. Output s16 stereo 48 kHz.
-- Ring holds PTS-stamped chunks (DeeVee's model). Loudness varies wildly between channels: optional simple slow AGC
-  in M4.
+- Ring holds PTS-stamped chunks (DeeVee's model). A timestamp jump inside a read (reconnect join, gap) is reported
+  to the presenter, which fades out to it and in after it over 64 samples (D-034).
+- **Volume Levelling** option (off by default, D-036): a slow gated AGC (`xs_agc_*`) to about −20 dBFS RMS, ±12 dB,
+  falling in 0.5 s and rising in 4 s, soft limit above −1 dBFS; reset on every tune.
 - No audio stream: emit silence at the tick rate, drive the clock from video PTS.
 
 ### 5.7 Playlists (xs_playlist.c)
@@ -433,9 +438,13 @@ All "in RetroArch" checks use the **user's Steam RetroArch** (§8), not VRT.
 
 ### M4 — Robustness
 - Reconnects, stalls, step-down to a lower variant, format changes mid-stream (resolution, codec, audio layout, ad
-  breaks), PTS wraps, long runs, loudness levelling, audio language choice.
-- **Done when:** fault-injection suite (server.py) passes; 8-hour run on one channel keeps A/V within ±1 frame with
-  no ring growth; mid-stream resolution change recovers within 1 s.
+  breaks), PTS wraps, loudness levelling, audio track choice (HDHomeRun channels carry SAP / described-video AC-3
+  tracks).
+- **Done when:** fault-injection suite (server.py) passes, including dropped connections and a server that goes away
+  and comes back; a mid-stream resolution change and a 5.1 ↔ stereo change recover within 1 s without clicks; a
+  stream crosses the 33-bit PTS wrap in sync; repeated stalls on HLS step down to a lower variant; audio tracks can be
+  picked by language and cycled.
+- **Deferred (user, 2026-10-22):** the 8-hour soak run (D-032). The 30-minute runs from M1 stand in for now.
 
 ### M5 — Distribution
 - Builds for Linux x86_64/arm64, Windows, macOS, Android via CI like DeeVee; packaging, GitHub release, possibly
@@ -514,7 +523,7 @@ guide listing the channels, content folder (`m3u` is also claimed by `pcsx_rearm
 | M2 Playlists | ☑ Done (2026-10-22) | `xs_playlist` (VLC m3u.c port + IPTV extensions), `xs_chan` (numbering, groups, last/previous remembered), `xs_input` (RetroPad with auto-repeat, keyboard digits), `xs_tv` (zap with settle, last channel, number entry, groups, list, info), overlay in `xs_osd` drawn in place (D-024). **make check 26/26** (parser on BOM/CRLF/quoted commas/EXTGRP/EXTVLCOPT/KODIPROP/Latin-1/relative URLs; zap over a 10-channel lineup with dead, slow, DRM, gappy and unreachable channels: picture 0.18–0.45 s after each tune; 20 quick taps = 1 tune; 20 zaps 0.67 s apart = 21 tunes, retro_run p99 ≈ 1 ms; hold; groups; list; remembered across restarts). **RetroArch** (scripted through its Network RetroPad with `tests/ra_press.py`: see notes): remembered channel restored, Up/Up/Up skipping DRM, B, list, R/L groups, 10 taps = 1 tune, 1.5 s hold = 1 tune; picture 0.06–0.47 s after each tune; 60 ticks/s. Not done: remote playlists (M3), keyboard digits only tested in the harness. **Next: M3.** |
 | M3 iptv-org | ☑ Done (2026-10-22) | `xs_fetch` (avio downloads, system CA bundle, close-delimited responses), `xs_iptv` (lineup thread: iptv-org lists, cache + offline fallback, filters, de-dup; channel lists at a URL), Channels options (generated tables), dead channels (24 h, auto-advance at start, D-029), favourites (X/Y), LOADING / NO CHANNELS cards. **make check 39/39** (fake iptv-org: cache, offline, TLS checked and refused, category, language, part-time, remote list, dead skip, favourites). **Live acceptance** (real iptv-org UK, 240 channels, channels 1–50 tuned by number 16 s apart): every channel ended with a picture (13) or marked dead (39); retro_run p99 0.16 ms, 12 % of one core over 13.7 min. |
 | M3b HDHomeRun | ☑ Done (2026-10-22) | `src/xs_hdhr.c` (UDP discovery written from libhdhomerun's protocol, mDNS fallback, discover.json/lineup.json via libretro-common rjson), Lineup option, major.minor numbers (`XS_CHNO`), tuner-aware failures. On the user's FLEX 4K (64 channels, 5 unplayable): found by broadcast in 0.8 s, 3.1 WEDU-HD 1080i MPEG-2 + AC-3 plays (picture 2.5 s after tune: MPEG-2 GOP), "10.1" typed tunes at once. Fake tuner in make check (numbers, typed 3.2, DRM/AC-4 skipped, busy tuner not "dead", HDHomeRun + iptv-org numbering, unreachable). **RetroArch:** Start Core with no content → FLEX 4K found, 64 channels, 3.1 WEDU PBS picture + sound (−31 dBFS through PulseAudio). |
-| M4 Robustness | ☐ | |
+| M4 Robustness | ☑ Done (2026-10-22) | Fixtures `hls_change` (720p stereo AC-3 → 1080p 5.1 at a discontinuity), `wrap.ts` (33-bit PTS wrap), `tracks.ts` / `hls_tracks` (eng 1 kHz, spa 500 Hz, eng described 2 kHz); server faults `_throttle`, `_outage`, `_dropevery`. Variant step-down (D-033), jump fades (D-034), all audio tracks decoded at once with instant L2 switching (D-035), Volume Levelling (D-036). **make check 47/47** (format change with no re-buffer, A/V ≤ 23 ms; wrap 300/300 pictures; 150 KB/s throttle steps 1080p → 720p after two stalls, then none; every 5th request dropped; 8 s outage reconnects and rejoins; Audio Language picks Spanish; L2 changes the tone from the very next beep; levelling −23 → −18.7 dBFS). **Harness on the HDHomeRun:** WEDU 3.1 at ~−30 dBFS levelled to ~−22. **RetroArch:** WEDU 3.1 (three AC-3 tracks eng/spa/fre) cycled with L2 through the Network RetroPad, 0 underruns, 60.2 ticks/s. Not done: the 8-hour soak (D-032); a reconnect join can leave a single A/V transient of ~100 ms. **Next: M5.** |
 | M5 Distribution | ☐ | |
 | After v1: VRT | — | Separate phase, out of scope here. |
 
@@ -564,6 +573,12 @@ guide listing the channels, content folder (`m3u` is also claimed by `pcsx_rearm
   <RetroArch>/cores/xstreemly_libretro.so xstreemly_libretro.so` and copy the `.info`.
 - With Lineup = Auto the core finds the user's real HDHomeRun on the LAN: tests that start without content must
   pin `HARNESS_OPT_xstreemly_source=iptv` (or use `XSTREEMLY_HDHR`), or they tune the real tuner.
+- M4 test notes (2026-10-22): `/_outage/` counts from the first request with that prefix (not server start, or it
+  had passed by the time make check reached it). Remuxing `tracks.ts` to HLS with `-c copy` drops the
+  `visual_impaired` disposition, so only the TS fixture has a "described" track. `tests/tone.py` lists the beeps
+  in a `HARNESS_WAV` file (start, Hz, dBFS). The Network RetroPad's L2 is id 12 (`ra_press.py` knows it). RetroArch
+  reads and writes per-core options in `<RetroArch>/config/X-Streemly/X-Streemly.opt`, not the test config's
+  `core_options_path`: set test options there (and put the defaults back).
 - iptv-org country playlists use `uk`, not ISO `gb` (`countries/gb.m3u` is a 404).
 - iptv-org `streams.json` carries per-stream `referrer` and `user_agent`; the M3U lists carry them as
   `#EXTVLCOPT` lines. Some streams don't play without them.
@@ -607,6 +622,11 @@ guide listing the channels, content folder (`m3u` is also claimed by `pcsx_rearm
 | D-029 | When the core picked the channel (start, new lineup) and it's dead, step on to the next, up to 20 times, until a button is pressed. | iptv-org lineups start with many dead channels (UK: channels 1–4 on 2026-10-22); landing on NO SIGNAL first is a poor start. | Accepted (2026-10-22, M3) |
 | D-030 | HDHomeRun discovery is SiliconDust's UDP broadcast, written from the protocol (libhdhomerun is LGPL-2.1+, used as the reference only), with `hdhomerun.local` as a fallback; channels come from `lineup.json` (not `lineup.m3u`) for its DRM and codec fields. | No new dependency; the JSON says which channels can't play. | Accepted (2026-10-22, M3b) |
 | D-031 | Channel numbers are `major * 1000 + minor` (`XS_CHNO`), shown "3.1" or "7". Number entry tunes as soon as no other number starts with what was typed. Lists keep their own numbers when every channel has a unique one. | ATSC sub-channels; one rule for "10.1" and for "24" in a 241-channel list. | Accepted (2026-10-22, M3b) |
+| D-032 | No 8-hour soak test in M4; revisit later if long-run problems show up. | User (2026-10-22): "a bit much". 30-minute harness and RetroArch runs already show no drift or ring growth. | **Accepted (user, 2026-10-22)** |
+| D-033 | Variant step-down: two underruns within 60 s on a live stream with a lower variant reconnect to the next variant down (keeping the serial, D-018); the learned extra buffer is dropped. Never steps back up. | FFmpeg's hls demuxer has no ABR; growing the buffer alone never catches up when the bandwidth is short. | Accepted (2026-10-22, M4) |
+| D-034 | Audio timestamp jumps inside a tick get a 64-sample fade out before and in after (as at underruns). | Reconnect joins and gaps clicked (harness click detector); the jump is found in the ring by comparing each chunk's start with where reading stopped. | Accepted (2026-10-22, M4) |
+| D-035 | All audio tracks (≤ 4) are decoded at once into per-track rings; L2 switches rings in the presenter. | Switching in the tuner waited for the read loop and then played out the old track's 2–6 s of buffer. Extra cost: one AC-3/AAC decode per track (~0.1 ms/packet). | Accepted (2026-10-22, M4) |
+| D-036 | Volume Levelling is a core option, off by default. | Any AGC changes the programme's own dynamics; off keeps the broadcast as sent, on is one setting away for zappers. | Accepted (2026-10-22, M4) |
 | D-021 | Live = no duration and (for non-hls inputs) no known size. | FFmpeg reports no duration for MPEG-TS over HTTP, so files were taken for live streams and "reconnected" in a loop. | Accepted (2026-10-21, M1) |
 
 ---

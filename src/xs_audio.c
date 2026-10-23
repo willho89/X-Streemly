@@ -23,6 +23,8 @@
 
 #define XS_ARING_CHUNKS  8192
 #define XS_ARING_POLL_US 50000
+/* Chunks further apart than this are a jump in the audio. */
+#define XS_ARING_JUMP_US 5000
 
 typedef struct
 {
@@ -45,6 +47,7 @@ struct xs_aring
    unsigned chead, ccount;
    unsigned head_off;      /* frames already read from the head chunk */
    int64_t  level_us;      /* source time of all unread audio */
+   int64_t  read_end_us;   /* where the last read stopped, for jumps across reads */
 
    double   ratio;
 };
@@ -61,6 +64,7 @@ xs_aring_t *xs_aring_new(unsigned seconds)
    r->lock  = slock_new();
    r->cond  = scond_new();
    r->ratio = 1.0;
+   r->read_end_us = INT64_MIN;
    if (!r->pcm || !r->lock || !r->cond)
    {
       xs_aring_free(r);
@@ -90,6 +94,7 @@ void xs_aring_flush(xs_aring_t *r, unsigned serial)
    r->head_off = 0;
    r->level_us = 0;
    r->ratio    = 1.0;
+   r->read_end_us = INT64_MIN;
    scond_broadcast(r->cond);
    slock_unlock(r->lock);
 }
@@ -170,10 +175,13 @@ bool xs_aring_clock(xs_aring_t *r, unsigned serial, int64_t *clock_us)
    return ok;
 }
 
-unsigned xs_aring_read(xs_aring_t *r, unsigned serial, int16_t *out, unsigned frames)
+unsigned xs_aring_read(xs_aring_t *r, unsigned serial, int16_t *out, unsigned frames, int *jump)
 {
    unsigned done = 0;
+   int64_t prev_end;
+   *jump = -1;
    slock_lock(r->lock);
+   prev_end = r->read_end_us;
    if (r->serial != serial)
    {
       slock_unlock(r->lock);
@@ -183,6 +191,13 @@ unsigned xs_aring_read(xs_aring_t *r, unsigned serial, int16_t *out, unsigned fr
    {
       chunk_t *c = &r->chunks[r->chead];
       unsigned n = c->frames - r->head_off, first;
+      if (prev_end != INT64_MIN && *jump < 0)
+      {
+         int64_t at = c->pts_us + (r->head_off ? head_consumed_us(r) : 0);   /* where we read from */
+         if (at - prev_end > XS_ARING_JUMP_US || prev_end - at > XS_ARING_JUMP_US)
+            *jump = (int)done;
+      }
+      prev_end = c->pts_us + c->src_us;   /* where this chunk ends */
       if (n > frames - done)
          n = frames - done;
       first = r->cap - r->rpos < n ? r->cap - r->rpos : n;
@@ -202,9 +217,118 @@ unsigned xs_aring_read(xs_aring_t *r, unsigned serial, int16_t *out, unsigned fr
       }
    }
    if (done)
+   {
+      /* exactly where reading stopped (mid-chunk or at its end) */
+      r->read_end_us = r->ccount ? r->chunks[r->chead].pts_us + head_consumed_us(r) : prev_end;
       scond_broadcast(r->cond);
+   }
    slock_unlock(r->lock);
    return done;
+}
+
+void xs_aring_discard_until(xs_aring_t *r, unsigned serial, int64_t pts_us)
+{
+   bool freed = false;
+   slock_lock(r->lock);
+   while (r->serial == serial && r->ccount)
+   {
+      chunk_t *c = &r->chunks[r->chead];
+      int64_t pos = c->pts_us + head_consumed_us(r);
+      unsigned n;
+      if (pos >= pts_us)
+         break;
+      if (c->pts_us + c->src_us <= pts_us)
+         n = c->frames - r->head_off;   /* all of it */
+      else
+      {
+         n = (unsigned)((pts_us - pos) * (int64_t)c->frames / (c->src_us ? c->src_us : 1));
+         if (!n)
+            break;
+      }
+      r->rpos = (r->rpos + n) % r->cap;
+      r->used -= n;
+      r->head_off += n;
+      freed = true;
+      if (r->head_off >= c->frames)
+      {
+         r->level_us -= c->src_us;
+         r->chead = (r->chead + 1) % XS_ARING_CHUNKS;
+         r->ccount--;
+         r->head_off = 0;
+      }
+      else
+         break;
+   }
+   if (freed)
+      scond_broadcast(r->cond);
+   slock_unlock(r->lock);
+}
+
+/* ---- loudness levelling ------------------------------------------------ */
+
+#define XS_AGC_TARGET   0.1     /* RMS, about -20 dBFS: broadcast dialogue level */
+#define XS_AGC_GATE     0.01    /* ticks quieter than -40 dBFS don't count */
+#define XS_AGC_MIN_GAIN 0.25    /* -12 dB */
+#define XS_AGC_MAX_GAIN 4.0     /* +12 dB */
+#define XS_AGC_TAU_S    3.0     /* loudness estimate */
+#define XS_AGC_FAST_S   1.0     /* the same over the first seconds of a channel */
+#define XS_AGC_DOWN_S   0.5     /* gain falling */
+#define XS_AGC_UP_S     4.0     /* gain rising */
+#define XS_AGC_LIMIT    0.89    /* -1 dBFS: soft limiting above this */
+
+void xs_agc_reset(xs_agc_t *a)
+{
+   a->ms       = 0.0;
+   a->gain     = 1.0;
+   a->settle_s = 0.0;
+}
+
+static int16_t agc_limit(double x)
+{
+   double ax = fabs(x);
+   if (ax > XS_AGC_LIMIT)   /* soft knee from -1 dBFS to full scale */
+   {
+      double over = (ax - XS_AGC_LIMIT) / (1.0 - XS_AGC_LIMIT);
+      ax = XS_AGC_LIMIT + (1.0 - XS_AGC_LIMIT) * over / (1.0 + over);
+      x  = x < 0 ? -ax : ax;
+   }
+   return (int16_t)lrint(x * 32767.0);
+}
+
+void xs_agc_process(xs_agc_t *a, int16_t *s, unsigned frames, unsigned rate)
+{
+   double sum = 0.0, ms, want, from = a->gain, dt, tau, step;
+   unsigned i;
+   if (!frames || !rate)
+      return;
+   dt = (double)frames / rate;
+   for (i = 0; i < frames * 2; i++)
+      sum += (double)s[i] * s[i];
+   ms = sum / (frames * 2) / (32768.0 * 32768.0);
+   if (ms > XS_AGC_GATE * XS_AGC_GATE)
+   {
+      tau = a->settle_s < 2 * XS_AGC_FAST_S ? XS_AGC_FAST_S : XS_AGC_TAU_S;
+      a->ms = a->ms > 0.0 ? a->ms + (ms - a->ms) * (1.0 - exp(-dt / tau)) : ms;
+      a->settle_s += dt;
+   }
+   if (a->ms > 0.0)
+   {
+      want = XS_AGC_TARGET / sqrt(a->ms);
+      if (want < XS_AGC_MIN_GAIN)
+         want = XS_AGC_MIN_GAIN;
+      if (want > XS_AGC_MAX_GAIN)
+         want = XS_AGC_MAX_GAIN;
+      tau  = want < a->gain ? XS_AGC_DOWN_S : XS_AGC_UP_S;
+      a->gain += (want - a->gain) * (1.0 - exp(-dt / tau));
+   }
+   /* Ramp across the tick so gain changes don't step. */
+   step = (a->gain - from) / frames;
+   for (i = 0; i < frames; i++)
+   {
+      double g = from + step * (i + 1);
+      s[2 * i]     = agc_limit(s[2 * i] * g / 32768.0);
+      s[2 * i + 1] = agc_limit(s[2 * i + 1] * g / 32768.0);
+   }
 }
 
 int64_t xs_aring_skip(xs_aring_t *r, unsigned serial, int64_t us)

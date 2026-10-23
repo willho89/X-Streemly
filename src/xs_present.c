@@ -46,6 +46,9 @@
  * the floor target grows with half the burst size seen (the level's
  * peak-to-trough over the window) and by a second after every underrun. */
 #define XS_UNDERRUN_STEP_US  1000000
+/* Two underruns this close together on a live HLS stream with a lower
+ * variant: the variant needs more bandwidth than there is, step down. */
+#define XS_STEP_DOWN_WITHIN_S 60.0
 #define XS_EXTRA_MAX_US      10000000
 
 typedef enum { P_WAIT = 0, P_BUFFERING, P_PLAYING } pstate_t;
@@ -61,6 +64,8 @@ struct xs_present
    unsigned  gen_seen;        /* the tune timed by tune_us */
    pstate_t  state;
    bool      has_audio, has_video;
+   unsigned  track, tracks;   /* the audio track played (its ring), of how many */
+   xs_agc_t  agc;
    bool      have_frame;      /* a stream frame is on screen */
    bool      started;         /* this serial played at least once */
    bool      pictured;        /* first picture of this tune shown */
@@ -83,6 +88,7 @@ struct xs_present
 
    /* stats */
    unsigned  underruns, shown, dropped;
+   uint64_t  last_underrun_tick;
    uint64_t  last_stats_tick;
    int64_t   last_stats_us;
 
@@ -100,6 +106,7 @@ xs_present_t *xs_present_new(xs_ctx_t *ctx, xs_tuner_t *tuner)
    p->ctx   = ctx;
    p->tuner = tuner;
    p->ratio = 1.0;
+   xs_agc_reset(&p->agc);
    xs_present_set_idle(p, "NO CONTENT", "LOAD A PLAYLIST OR A .STRM FILE");
    return p;
 }
@@ -159,6 +166,10 @@ static void reset(xs_present_t *p, const xs_tuner_status_t *st)
    p->serial     = st->serial;
    p->has_audio  = st->has_audio;
    p->has_video  = st->has_video;
+   /* The viewer's track choice lasts for the tune, across reopens. */
+   if (st->gen != p->gen_seen || p->track >= st->audio_tracks)
+      p->track = st->audio_default < st->audio_tracks ? st->audio_default : 0;
+   p->tracks     = st->audio_tracks;
    p->have_frame = false;
    p->started    = false;
    if (st->gen != p->gen_seen)
@@ -166,6 +177,7 @@ static void reset(xs_present_t *p, const xs_tuner_status_t *st)
       p->gen_seen = st->gen;
       p->pictured = false;
       p->tune_us  = av_gettime_relative();
+      xs_agc_reset(&p->agc);   /* a new channel: its own loudness */
    }
    p->ratio      = 1.0;
    p->floor_us   = 0;
@@ -263,7 +275,7 @@ static bool controller(xs_present_t *p, double fps, int64_t level_us)
 
    if (p->buckets_full >= XS_FLOOR_BUCKETS && floor_us - target > XS_CATCHUP_EXCESS_US)
    {
-      int64_t skipped = xs_aring_skip(xs_tuner_aring(p->tuner), p->serial,
+      int64_t skipped = xs_aring_skip(xs_tuner_aring(p->tuner, p->track), p->serial,
                                       floor_us - target - XS_CATCHUP_KEEP_US);
       XS_INFO(p->ctx, "caught up with the live edge: skipped %.2f s (floor was %.2f s, target %.2f s)\n",
               skipped / 1e6, floor_us / 1e6, target / 1e6);
@@ -281,7 +293,11 @@ static bool controller(xs_present_t *p, double fps, int64_t level_us)
    if (ratio < 1.0 - XS_RATIO_MAX)
       ratio = 1.0 - XS_RATIO_MAX;
    p->ratio = ratio;
-   xs_aring_set_ratio(xs_tuner_aring(p->tuner), ratio);
+   {
+      unsigned i;
+      for (i = 0; i < XS_MAX_TRACKS; i++)
+         xs_aring_set_ratio(xs_tuner_aring(p->tuner, i), ratio);
+   }
    return false;
 }
 
@@ -304,7 +320,7 @@ bool xs_present_card_showing(const xs_present_t *p)
 void xs_present_log_stats(xs_present_t *p)
 {
    xs_video_stats_t vs;
-   xs_aring_t *ar = xs_tuner_aring(p->tuner);
+   xs_aring_t *ar = xs_tuner_aring(p->tuner, p->track);
    int64_t now = av_gettime_relative();
    double tick_rate = p->last_stats_us && now > p->last_stats_us
                     ? (p->ticks - p->last_stats_tick) * 1e6 / (double)(now - p->last_stats_us) : 0.0;
@@ -353,11 +369,41 @@ static void stream_picture(xs_present_t *p, int64_t until_us, xs_picture_t *pic,
    p->card_on_screen = false;
 }
 
+/* The tracks not being played are decoded all the same; keep them level
+ * with the one that is, so a switch picks up at the same moment and they
+ * never fill up and hold the tuner back. */
+static void trim_other_tracks(xs_present_t *p, xs_aring_t *ar)
+{
+   int64_t pos;
+   unsigned i;
+   if (p->tracks < 2 || !xs_aring_clock(ar, p->serial, &pos))
+      return;
+   for (i = 0; i < p->tracks && i < XS_MAX_TRACKS; i++)
+      if (i != p->track)
+         xs_aring_discard_until(xs_tuner_aring(p->tuner, i), p->serial, pos);
+}
+
+void xs_present_next_audio(xs_present_t *p)
+{
+   if (p->tracks > 1)
+   {
+      p->track = (p->track + 1) % p->tracks;
+      XS_INFO(p->ctx, "audio: track %u of %u\n", p->track + 1, p->tracks);
+   }
+}
+
+unsigned xs_present_audio_track(const xs_present_t *p, unsigned *tracks)
+{
+   if (tracks)
+      *tracks = p->tracks;
+   return p->track;
+}
+
 void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frames,
                      xs_picture_t *pic)
 {
    xs_tuner_status_t st;
-   xs_aring_t *ar = xs_tuner_aring(p->tuner);
+   xs_aring_t *ar;
    xs_video_t *vid = xs_tuner_video(p->tuner);
    int64_t tick_us = (int64_t)(1e6 / fps);
    bool more_coming, have = false;
@@ -379,6 +425,7 @@ void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frame
        (p->state == P_WAIT && has_media(&st)))
       reset(p, &st);
    more_coming = st.state == XS_TUNER_PLAYING;
+   ar = xs_tuner_aring(p->tuner, p->track);
 
    if (p->state == P_WAIT)
    {
@@ -435,7 +482,21 @@ void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frame
       if (!xs_aring_clock(ar, p->serial, &p->clock_us))
          got = 0;
       else
-         got = xs_aring_read(ar, p->serial, audio, frames);
+      {
+         int jump;
+         got = xs_aring_read(ar, p->serial, audio, frames, &jump);
+         /* A jump inside the tick (reconnect, join): fade out to it and in
+          * after it, so the cut doesn't click (DeeVee D-013's edge fades). */
+         if (jump == 0)
+            fade(audio, got < XS_FADE ? got : XS_FADE, true);
+         else if (jump > 0)
+         {
+            unsigned j = (unsigned)jump, out = j < XS_FADE ? j : XS_FADE;
+            unsigned in = got - j < XS_FADE ? got - j : XS_FADE;
+            fade(audio + 2 * (j - out), out, false);
+            fade(audio + 2 * j, in, true);
+         }
+      }
       if (p->fade_in && got)
       {
          unsigned n = got < p->fade_in ? got : p->fade_in;
@@ -446,8 +507,20 @@ void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frame
       {
          fade(audio + 2 * (got > XS_FADE ? got - XS_FADE : 0), got > XS_FADE ? XS_FADE : got, false);
          p->underruns++;
-         if (st.live && more_coming && p->extra_us < XS_EXTRA_MAX_US)
-            p->extra_us += XS_UNDERRUN_STEP_US;
+         if (st.live && more_coming && st.can_step_down && p->last_underrun_tick &&
+             (p->ticks - p->last_underrun_tick) / fps < XS_STEP_DOWN_WITHIN_S)
+         {
+            XS_INFO(p->ctx, "two stalls within %.0f s: asking for a lower variant\n", XS_STEP_DOWN_WITHIN_S);
+            xs_tuner_step_down(p->tuner);
+            p->extra_us = 0;   /* the buffer grew for the wrong variant */
+            p->last_underrun_tick = 0;
+         }
+         else
+         {
+            if (st.live && more_coming && p->extra_us < XS_EXTRA_MAX_US)
+               p->extra_us += XS_UNDERRUN_STEP_US;
+            p->last_underrun_tick = p->ticks;
+         }
          XS_WARN(p->ctx, "audio underrun (%u of %u samples)%s, buffer target now %.2f s\n", got, frames,
                  more_coming ? ", re-buffering" : "", floor_target(p) / 1e6);
          set_state(p, P_BUFFERING);
@@ -461,6 +534,9 @@ void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frame
    }
    else
       p->clock_us += tick_us;
+   trim_other_tracks(p, ar);
+   if (p->ctx->opt.level_audio && p->has_audio)
+      xs_agc_process(&p->agc, audio, frames, XS_SAMPLE_RATE);
 
    if (p->has_video)
    {

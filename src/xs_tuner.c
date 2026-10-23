@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <libavutil/time.h>
 #include <rthreads/rthreads.h>
@@ -40,6 +41,7 @@
 #define XS_BACK_MAX_US     1000000LL
 #define XS_GAP_MAX_US      10000000LL
 #define XS_MAX_STREAMS     64
+#define XS_MAX_AUDIO       XS_MAX_TRACKS
 #define XS_EPOCHS          16
 
 struct xs_tuner
@@ -55,17 +57,21 @@ struct xs_tuner
    bool        have_source; /* the command for gen is a tune */
    xs_source_t pending;
    unsigned    max_height;
+   bool        step_down;   /* xs_tuner_step_down() asked for a lower variant */
+   char        audio_lang[8];
 
    /* published status (lock) */
    xs_tuner_status_t status;
 
    /* pipeline (own locks) */
    xs_pktq_t  *vq;
-   xs_aring_t *aring;
+   xs_aring_t *aring[XS_MAX_TRACKS];
    xs_video_t *video;
 
    /* tuner thread only */
    unsigned    run_gen;     /* generation being played */
+   unsigned    var_height;  /* chosen variant's video height */
+   bool        var_lower;   /* a lower variant exists */
    unsigned    serial;      /* last attempt */
    int64_t     deadline;    /* av_gettime_relative() limit, 0 = none */
    bool        timed_out;
@@ -91,15 +97,24 @@ static bool superseded(xs_tuner_t *t)
    return s;
 }
 
+static bool step_down_asked(xs_tuner_t *t)
+{
+   bool s;
+   slock_lock(t->lock);
+   s = t->step_down;
+   slock_unlock(t->lock);
+   return s;
+}
+
 static int stop_cb(void *opaque)
 {
-   return superseded(opaque);
+   return superseded(opaque) || step_down_asked(opaque);
 }
 
 static int interrupt_cb(void *opaque)
 {
    xs_tuner_t *t = opaque;
-   if (superseded(t))
+   if (superseded(t) || step_down_asked(t))
       return 1;
    if (t->deadline && av_gettime_relative() > t->deadline)
    {
@@ -111,7 +126,9 @@ static int interrupt_cb(void *opaque)
 
 typedef struct
 {
-   bool has_audio, has_video, live;
+   bool     has_audio, has_video, live;
+   unsigned height;
+   bool     can_step_down;
 } media_info_t;
 
 static void publish(xs_tuner_t *t, xs_tuner_state_t state, const char *msg,
@@ -130,6 +147,8 @@ static void publish(xs_tuner_t *t, xs_tuner_state_t state, const char *msg,
          t->status.has_audio = mi->has_audio;
          t->status.has_video = mi->has_video;
          t->status.live      = mi->live;
+         t->status.height    = mi->height;
+         t->status.can_step_down = mi->can_step_down;
       }
       if (msg)
          snprintf(t->status.msg, sizeof(t->status.msg), "%s", msg);
@@ -246,8 +265,9 @@ static int select_variant(xs_tuner_t *t, AVFormatContext *fmt, unsigned max_heig
 {
    const AVProgram *pick = NULL, *smallest = NULL;
    unsigned i, j;
-   int vi;
+   int vi, ph;
 
+   t->var_lower = false;
    if (fmt->nb_programs < 2)
       return tallest_video(fmt, fmt->nb_programs ? fmt->programs[0] : NULL);
 
@@ -285,6 +305,13 @@ static int select_variant(xs_tuner_t *t, AVFormatContext *fmt, unsigned max_heig
          fmt->streams[i]->discard = AVDISCARD_ALL;
    }
    vi = tallest_video(fmt, pick);
+   ph = vi >= 0 ? fmt->streams[vi]->codecpar->height : 0;
+   for (i = 0; i < fmt->nb_programs; i++)
+   {
+      int v = tallest_video(fmt, fmt->programs[i]);
+      if (v >= 0 && fmt->streams[v]->codecpar->height < ph)
+         t->var_lower = true;
+   }
    XS_INFO(t->ctx, "variant: program %d, %dx%d, %lld kb/s (of %u)%s\n", pick->id,
            vi >= 0 ? fmt->streams[vi]->codecpar->width : 0,
            vi >= 0 ? fmt->streams[vi]->codecpar->height : 0,
@@ -378,9 +405,79 @@ static void unwrap(xs_tuner_t *t, const AVStream *st, AVPacket *pkt)
       pkt->dts += off;
 }
 
+/* ---- audio tracks ----------------------------------------------------------- */
+
+/* ISO 639-2 has bibliographic codes beside the terminology ones that
+ * iptv-org and most muxers use: treat them as the same language. */
+static bool same_language(const char *a, const char *b)
+{
+   static const char *pairs[][2] = {
+      { "fre", "fra" }, { "ger", "deu" }, { "dut", "nld" }, { "chi", "zho" }, { "cze", "ces" },
+      { "gre", "ell" }, { "per", "fas" }, { "rum", "ron" }, { "slo", "slk" }, { "alb", "sqi" },
+      { "arm", "hye" }, { "baq", "eus" }, { "bur", "mya" }, { "geo", "kat" }, { "ice", "isl" },
+      { "mac", "mkd" }, { "mao", "mri" }, { "may", "msa" }, { "tib", "bod" }, { "wel", "cym" },
+   };
+   unsigned i;
+   if (!strcasecmp(a, b))
+      return true;
+   for (i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++)
+      if ((!strcasecmp(a, pairs[i][0]) && !strcasecmp(b, pairs[i][1])) ||
+          (!strcasecmp(a, pairs[i][1]) && !strcasecmp(b, pairs[i][0])))
+         return true;
+   return false;
+}
+
+static const char *stream_lang(const AVStream *st)
+{
+   const AVDictionaryEntry *e = av_dict_get(st->metadata, "language", NULL, 0);
+   return e && e->value[0] ? e->value : "";
+}
+
+static bool described(const AVStream *st)
+{
+   return (st->disposition & (AV_DISPOSITION_VISUAL_IMPAIRED | AV_DISPOSITION_HEARING_IMPAIRED)) != 0;
+}
+
+/* The audio track to start with: the preferred language (not an
+ * audio-description track if there's another), else FFmpeg's best. */
+static unsigned pick_audio(const AVFormatContext *fmt, const int *cand, unsigned n, int best, const char *lang)
+{
+   unsigned i, pass;
+   if (lang[0])
+      for (pass = 0; pass < 2; pass++)
+         for (i = 0; i < n; i++)
+         {
+            const AVStream *st = fmt->streams[cand[i]];
+            if (same_language(stream_lang(st), lang) && (pass || !described(st)))
+               return i;
+         }
+   for (i = 0; i < n; i++)
+      if (cand[i] == best)
+         return i;
+   return 0;
+}
+
+static void audio_status(xs_tuner_t *t, const AVFormatContext *fmt, const int *cand, unsigned n, unsigned def)
+{
+   unsigned i;
+   slock_lock(t->lock);
+   if (t->gen == t->run_gen)
+   {
+      t->status.audio_tracks  = n;
+      t->status.audio_default = def;
+      for (i = 0; i < XS_MAX_TRACKS; i++)
+      {
+         snprintf(t->status.audio_lang[i], sizeof(t->status.audio_lang[i]), "%s",
+                  i < n ? stream_lang(fmt->streams[cand[i]]) : "");
+         t->status.audio_described[i] = i < n && described(fmt->streams[cand[i]]);
+      }
+   }
+   slock_unlock(t->lock);
+}
+
 /* ---- one attempt ---------------------------------------------------------- */
 
-typedef enum { RUN_ABORTED, RUN_FAILED, RUN_ENDED } run_result_t;
+typedef enum { RUN_ABORTED, RUN_FAILED, RUN_ENDED, RUN_STEP_DOWN } run_result_t;
 
 
 /* One attempt. resume: a reconnect after this serial already delivered
@@ -393,13 +490,17 @@ static run_result_t play_source(xs_tuner_t *t, const xs_source_t *src, unsigned 
    AVIOInterruptCB icb = { interrupt_cb, t };
    AVFormatContext *fmt = NULL;
    AVPacket *pkt = NULL;
-   xs_adec_t *adec = NULL;
-   media_info_t mi = { false, false, false };
+   xs_adec_t *adec[XS_MAX_TRACKS] = { NULL };
+   media_info_t mi;
    char msg[256];
    uint64_t packets = 0, bytes = 0;
    int64_t start = av_gettime_relative(), first_pkt = 0;
    run_result_t result;
    int ret, vi, ai = -1, i;
+   int cand[XS_MAX_AUDIO];
+   unsigned ncand = 0, acur = 0, atrk = 0;
+
+   memset(&mi, 0, sizeof(mi));
 
    *delivered = false;
    if (resume)
@@ -408,7 +509,8 @@ static run_result_t play_source(xs_tuner_t *t, const xs_source_t *src, unsigned 
    {
       t->serial++;
       xs_pktq_flush(t->vq);
-      xs_aring_flush(t->aring, t->serial);
+      for (i = 0; i < XS_MAX_TRACKS; i++)
+         xs_aring_flush(t->aring[i], t->serial);
       xs_video_flush(t->video, t->serial);
       timeline_reset(t);
       t->rejoin = false;
@@ -439,17 +541,38 @@ static run_result_t play_source(xs_tuner_t *t, const xs_source_t *src, unsigned 
       AVStream *st = fmt->streams[vi];
       xs_video_configure(t->video, t->serial, st, av_guess_frame_rate(fmt, st, NULL));
       mi.has_video = true;
+      t->var_height = (unsigned)st->codecpar->height;
+      mi.height = t->var_height;
+      mi.can_step_down = t->var_lower;
    }
    else
       XS_WARN(ctx, "no video stream\n");
-   ai = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, vi, NULL, 0);
-   if (ai >= 0 && fmt->streams[ai]->discard == AVDISCARD_ALL)
-      ai = -1;
-   if (ai >= 0 && (adec = xs_adec_open(ctx, fmt->streams[ai])))
-      mi.has_audio = true;
+   /* Audio tracks: those of the chosen variant that can be decoded (§M4).
+    * Every one is decoded, each into its own ring, so switching tracks is
+    * instant: the presenter just reads another ring. */
+   for (i = 0; i < (int)fmt->nb_streams && ncand < XS_MAX_AUDIO; i++)
+      if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && fmt->streams[i]->discard != AVDISCARD_ALL &&
+          (adec[ncand] = xs_adec_open(ctx, fmt->streams[i])))
+         cand[ncand++] = i;
+   mi.has_audio = ncand > 0;
+   if (ncand)
+   {
+      char lang[8];
+      slock_lock(t->lock);
+      snprintf(lang, sizeof(lang), "%s", t->audio_lang);
+      slock_unlock(t->lock);
+      acur = pick_audio(fmt, cand, ncand, av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, vi, NULL, 0), lang);
+      ai = cand[acur];
+   }
    for (i = 0; i < (int)fmt->nb_streams; i++)
-      if (i != vi && i != ai)
+   {
+      bool keep = i == vi;
+      unsigned k;
+      for (k = 0; k < ncand; k++)
+         keep |= cand[k] == i;
+      if (!keep)
          fmt->streams[i]->discard = AVDISCARD_ALL;
+   }
    mi.live = is_live(fmt);
 
    if (vi >= 0)
@@ -458,11 +581,16 @@ static run_result_t play_source(xs_tuner_t *t, const xs_source_t *src, unsigned 
       AVRational fr = av_guess_frame_rate(fmt, fmt->streams[vi], NULL);
       snprintf(msg, sizeof(msg), "%s %dx%d %.4g fps%s%s", avcodec_get_name(par->codec_id),
                par->width, par->height, fr.den ? av_q2d(fr) : 0.0,
-               adec ? ", " : "", adec ? avcodec_get_name(fmt->streams[ai]->codecpar->codec_id) : "");
+               ai >= 0 ? ", " : "", ai >= 0 ? avcodec_get_name(fmt->streams[ai]->codecpar->codec_id) : "");
    }
    else
-      snprintf(msg, sizeof(msg), "%s (audio only)", adec ? avcodec_get_name(fmt->streams[ai]->codecpar->codec_id) : "?");
+      snprintf(msg, sizeof(msg), "%s (audio only)", ai >= 0 ? avcodec_get_name(fmt->streams[ai]->codecpar->codec_id) : "?");
    publish(t, XS_TUNER_PLAYING, msg, &mi, 0, 0);
+   audio_status(t, fmt, cand, ncand, acur);
+   if (ncand > 1)
+      XS_INFO(ctx, "audio: %u tracks, starting with %u (%s%s)\n", ncand, acur + 1,
+              stream_lang(fmt->streams[ai])[0] ? stream_lang(fmt->streams[ai]) : "no language tag",
+              described(fmt->streams[ai]) ? ", described" : "");
 
    pkt = av_packet_alloc();
    for (;;)
@@ -479,10 +607,17 @@ static run_result_t play_source(xs_tuner_t *t, const xs_source_t *src, unsigned 
       }
       if (ret < 0)
          break;
-      if (pkt->stream_index != vi && pkt->stream_index != ai)
+      if (pkt->stream_index != vi)
       {
-         av_packet_unref(pkt);
-         continue;
+         unsigned k;
+         for (k = 0; k < ncand && cand[k] != pkt->stream_index; k++)
+            ;
+         if (k == ncand)
+         {
+            av_packet_unref(pkt);
+            continue;
+         }
+         atrk = k;
       }
       if (!packets)
       {
@@ -500,7 +635,7 @@ static run_result_t play_source(xs_tuner_t *t, const xs_source_t *src, unsigned 
                           pkt->duration > 0 ? av_rescale_q(pkt->duration, st->time_base, AV_TIME_BASE_Q) : 0,
                           stop_cb, t);
       else
-         ok = xs_adec_packet(adec, pkt, t->aring, t->serial, stop_cb, t);
+         ok = xs_adec_packet(adec[atrk], pkt, t->aring[atrk], t->serial, stop_cb, t);
       av_packet_unref(pkt);
       if (!ok)
          break;   /* superseded while waiting for space */
@@ -513,14 +648,17 @@ static run_result_t play_source(xs_tuner_t *t, const xs_source_t *src, unsigned 
            first_pkt ? (av_gettime_relative() - first_pkt) / 1e6 : 0.0);
    if (superseded(t))
       result = RUN_ABORTED;   /* channel change or unload: nothing to report */
+   else if (step_down_asked(t))
+      result = RUN_STEP_DOWN;
    else
    {
       if (ret == AVERROR_EOF && !mi.live)
       {
          /* Let the decoders finish what they hold. Not on a live failure:
           * the reconnect continues with the same decoders. */
-         if (adec)
-            xs_adec_packet(adec, NULL, t->aring, t->serial, stop_cb, t);
+         for (i = 0; i < (int)ncand; i++)
+            if (adec[i])
+               xs_adec_packet(adec[i], NULL, t->aring[i], t->serial, stop_cb, t);
          if (vi >= 0 && pkt)
          {
             av_packet_unref(pkt);   /* empty packet = drain */
@@ -540,7 +678,8 @@ static run_result_t play_source(xs_tuner_t *t, const xs_source_t *src, unsigned 
       }
    }
    av_packet_free(&pkt);
-   xs_adec_free(adec);
+   for (i = 0; i < XS_MAX_TRACKS; i++)
+      xs_adec_free(adec[i]);
    avformat_close_input(&fmt);
    return result;
 }
@@ -581,12 +720,26 @@ static void tuner_thread(void *arg)
       }
       src = t->pending;
       max_height = t->max_height;
+      t->step_down = false;
       slock_unlock(t->lock);
       bool resume = false;
+      unsigned step_cap = 0;   /* from step-downs, for this tune */
       for (;;)
       {
          bool delivered;
-         run_result_t r = play_source(t, &src, max_height, resume, &delivered);
+         unsigned cap = step_cap && (!max_height || step_cap < max_height) ? step_cap : max_height;
+         run_result_t r = play_source(t, &src, cap, resume, &delivered);
+         if (r == RUN_STEP_DOWN)
+         {
+            /* Same stream, the next lower variant, nothing buffered lost. */
+            step_cap = t->var_height > 1 ? t->var_height - 1 : 1;
+            XS_INFO(t->ctx, "variant: %up can't keep up, stepping down\n", t->var_height);
+            resume = true;
+            slock_lock(t->lock);
+            t->step_down = false;
+            slock_unlock(t->lock);
+            continue;
+         }
          if (r != RUN_FAILED)
             break;
          /* Once a serial has delivered media, reconnects keep it (and what
@@ -613,23 +766,27 @@ static void tuner_thread(void *arg)
 xs_tuner_t *xs_tuner_new(xs_ctx_t *ctx)
 {
    xs_tuner_t *t = calloc(1, sizeof(*t));
+   bool rings = true;
+   unsigned i;
    if (!t)
       return NULL;
    t->ctx   = ctx;
    t->lock  = slock_new();
    t->cond  = scond_new();
    t->vq    = xs_pktq_new(XS_QUEUE_SECONDS * 1000000LL, XS_VQUEUE_BYTES);
-   t->aring = xs_aring_new(XS_QUEUE_SECONDS + 4);
+   for (i = 0; i < XS_MAX_TRACKS; i++)
+      rings &= (t->aring[i] = xs_aring_new(XS_QUEUE_SECONDS + 4)) != NULL;
    if (t->vq)
       t->video = xs_video_new(ctx, t->vq);
-   if (t->lock && t->cond && t->aring && t->video)
+   if (t->lock && t->cond && rings && t->video)
       t->thread = sthread_create(tuner_thread, t);
    if (!t->thread)
    {
       XS_ERROR(ctx, "can't start the tuner\n");
       xs_video_free(t->video);
       xs_pktq_free(t->vq);
-      xs_aring_free(t->aring);
+      for (i = 0; i < XS_MAX_TRACKS; i++)
+         xs_aring_free(t->aring[i]);
       if (t->cond)
          scond_free(t->cond);
       if (t->lock)
@@ -643,6 +800,7 @@ xs_tuner_t *xs_tuner_new(xs_ctx_t *ctx)
 void xs_tuner_free(xs_tuner_t *t)
 {
    int64_t start;
+   unsigned i;
    if (!t)
       return;
    start = av_gettime_relative();
@@ -654,7 +812,8 @@ void xs_tuner_free(xs_tuner_t *t)
    xs_video_free(t->video);
    XS_DEBUG(t->ctx, "tuner stopped in %lld ms\n", (long long)((av_gettime_relative() - start) / 1000));
    xs_pktq_free(t->vq);
-   xs_aring_free(t->aring);
+   for (i = 0; i < XS_MAX_TRACKS; i++)
+      xs_aring_free(t->aring[i]);
    scond_free(t->cond);
    slock_free(t->lock);
    free(t);
@@ -692,6 +851,21 @@ void xs_tuner_get_status(xs_tuner_t *t, xs_tuner_status_t *out)
    slock_unlock(t->lock);
 }
 
+void xs_tuner_set_audio_lang(xs_tuner_t *t, const char *lang)
+{
+   slock_lock(t->lock);
+   snprintf(t->audio_lang, sizeof(t->audio_lang), "%s", lang ? lang : "");
+   slock_unlock(t->lock);
+}
+
+void xs_tuner_step_down(xs_tuner_t *t)
+{
+   slock_lock(t->lock);
+   if (t->status.can_step_down && t->status.gen == t->gen)
+      t->step_down = true;
+   slock_unlock(t->lock);
+}
+
 void xs_tuner_set_max_height(xs_tuner_t *t, unsigned max_height)
 {
    slock_lock(t->lock);
@@ -699,5 +873,5 @@ void xs_tuner_set_max_height(xs_tuner_t *t, unsigned max_height)
    slock_unlock(t->lock);
 }
 
-xs_aring_t *xs_tuner_aring(xs_tuner_t *t) { return t->aring; }
+xs_aring_t *xs_tuner_aring(xs_tuner_t *t, unsigned i) { return t->aring[i < XS_MAX_TRACKS ? i : 0]; }
 xs_video_t *xs_tuner_video(xs_tuner_t *t) { return t->video; }
