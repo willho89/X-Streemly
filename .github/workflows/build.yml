@@ -12,6 +12,8 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    # Notes and docs only: nothing to build (tag pushes ignore this).
+    paths-ignore: ['**.md', 'docs/**']
   pull_request:
   workflow_dispatch:
 
