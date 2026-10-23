@@ -479,6 +479,7 @@ void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frame
    if (p->has_audio)
    {
       unsigned got;
+      bool short_next = false;
       if (!xs_aring_clock(ar, p->serial, &p->clock_us))
          got = 0;
       else
@@ -503,7 +504,12 @@ void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frame
          fade(audio, n, true);
          p->fade_in = 0;
       }
-      if (got < frames)
+      /* Not enough left for the next tick: stall now, so this tick's end
+       * can fade out (an empty ring at the next tick would leave the last
+       * sample hanging: a click). */
+      if (got == frames && more_coming && xs_aring_level_us(ar, p->serial) < tick_us)
+         short_next = true;
+      if (got < frames || short_next)
       {
          fade(audio + 2 * (got > XS_FADE ? got - XS_FADE : 0), got > XS_FADE ? XS_FADE : got, false);
          p->underruns++;
@@ -526,7 +532,7 @@ void xs_present_tick(xs_present_t *p, double fps, int16_t *audio, unsigned frame
          set_state(p, P_BUFFERING);
       }
       /* Nothing to correct on a file: it can't drift. */
-      if (st.live && got == frames && controller(p, fps, xs_aring_level_us(ar, p->serial)))
+      if (st.live && got == frames && !short_next && controller(p, fps, xs_aring_level_us(ar, p->serial)))
       {
          fade(audio, frames, false);   /* the next tick fades in after the skip */
          p->fade_in = XS_FADE;

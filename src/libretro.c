@@ -589,6 +589,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    if (!environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir) || !save_dir)
       save_dir = "";
    snprintf(g_save_dir, sizeof(g_save_dir), "%s", save_dir);
+   snprintf(g_ctx->save_dir, sizeof(g_ctx->save_dir), "%s", save_dir);
 
    /* What the lineup comes from: a local list or .strm now; a list at a URL
     * or iptv-org later, from the lineup thread (the TV starts empty). */

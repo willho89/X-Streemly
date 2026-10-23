@@ -31,9 +31,11 @@ typedef struct
 int xs_fetch(xs_ctx_t *ctx, const char *url, const xs_fetch_opts_t *o, char **out, size_t *len,
              char *err, size_t errlen);
 
-/* The system's CA bundle, or NULL if none is found (verification is then
- * skipped with a warning; an embedded bundle comes with the non-Linux
- * builds, M5). */
-const char *xs_fetch_ca_file(void);
+/* The CA bundle to check certificates against (D-027), or NULL if there is
+ * none (verification is then skipped with a warning). Linux and macOS: the
+ * system's bundle. Android: the system's certificates (one file each)
+ * gathered into <save_dir>/X-Streemly/cacerts.pem. Windows needs none:
+ * schannel checks against the Windows certificate store. */
+const char *xs_fetch_ca_file(xs_ctx_t *ctx);
 
 #endif

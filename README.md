@@ -60,8 +60,10 @@ https://example.com/live/channel/playlist.m3u8
   player…) to X-Streemly over the network.
 
 ## Building
-Linux x86_64 for now: `make` (builds FFmpeg and mbedTLS from the submodules first), `make fixtures && make check`
-for the tests. See [CLAUDE.md](CLAUDE.md) §6.
+`make` builds FFmpeg and mbedTLS from the submodules first, then the core; `make fixtures && make check` runs the
+tests. Other targets: `make platform=win` (MinGW-w64 cross build; tests under Wine), `platform=osx` (on a Mac),
+`platform=linux-arm64` / `linux-armhf` (cross), `platform=android-arm64` / `android-armv7` (Android NDK). CI builds
+all of them on every push. See [CLAUDE.md](CLAUDE.md) §6.
 
 ## License
 GPL-2.0-or-later. See [LICENSE](LICENSE). Builds include FFmpeg with mbedTLS (configured `--enable-version3`), so

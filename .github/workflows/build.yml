@@ -1,0 +1,226 @@
+# X-Streemly — build every platform (CLAUDE.md M5) and run make check
+# where the platform can run it: natively on Linux and macOS, under Wine for
+# Windows. ARM Linux and Android are built only (a real-time test of 1080p
+# decoding under qemu-user can't keep up).
+#
+# The test streams are generated once on Linux (ffmpeg, openssl) and shared
+# with the macOS and Windows jobs. FFmpeg and mbedTLS builds are cached per
+# platform. Each job uploads its packaged core.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Release builds are named after the tag (v0.1.0 -> 0.1.0), others after
+# the commit.
+env:
+  VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('dev-{0}', github.sha) }}
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nasm pkg-config ffmpeg openssl python3 zip
+      - name: Dependency cache key
+        id: deps
+        run: echo "key=$(git submodule status | sha1sum | cut -c1-16)-${{ hashFiles('Makefile', 'Makefile.deps') }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            build/ffmpeg
+            build/mbedtls
+          key: deps-unix-${{ steps.deps.outputs.key }}
+      - name: Build
+        run: make -j4
+      - name: Test
+        run: |
+          make fixtures
+          make check
+      - name: Package
+        run: tests/ci/package.sh ./xstreemly_libretro.so strip linux-x86_64 "${VERSION#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: build/fixtures
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-linux-x86_64
+          path: build/package/*.zip
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: check-logs-linux-x86_64
+          path: build/check
+
+  windows-x86_64:
+    runs-on: ubuntu-24.04
+    needs: linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: build/fixtures
+      - name: Mark the downloaded fixtures as built
+        run: touch build/fixtures/.stamp
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nasm pkg-config python3 zip mingw-w64 wine64
+      - name: Dependency cache key
+        id: deps
+        run: echo "key=$(git submodule status | sha1sum | cut -c1-16)-${{ hashFiles('Makefile', 'Makefile.deps') }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: build/win64/ffmpeg
+          key: deps-win64-${{ steps.deps.outputs.key }}
+      - name: Build (MinGW-w64, schannel)
+        run: make -j4 platform=win
+      - name: Test under Wine
+        run: make platform=win check
+      - name: Package
+        run: tests/ci/package.sh ./xstreemly_libretro.dll x86_64-w64-mingw32-strip windows-x86_64 "${VERSION#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-windows-x86_64
+          path: build/package/*.zip
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: check-logs-windows-x86_64
+          path: build/win64/check
+
+  cross:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-arm64
+            strip: aarch64-linux-gnu-strip
+          - platform: linux-armhf
+            strip: arm-linux-gnueabihf-strip
+          - platform: android-arm64
+            strip: llvm-strip
+          - platform: android-armv7
+            strip: llvm-strip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q pkg-config zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+      - name: Dependency cache key
+        id: deps
+        run: echo "key=$(git submodule status | sha1sum | cut -c1-16)-${{ hashFiles('Makefile', 'Makefile.deps') }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            build/${{ matrix.platform }}/ffmpeg
+            build/${{ matrix.platform }}/mbedtls
+          key: deps-${{ matrix.platform }}-${{ steps.deps.outputs.key }}
+      - name: Build
+        run: |
+          # The runner image ships an NDK; Android builds use it.
+          make -j4 platform=${{ matrix.platform }} NDK="$ANDROID_NDK_LATEST_HOME"
+      - name: Package
+        run: |
+          export PATH="$PATH:$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          tests/ci/package.sh build/${{ matrix.platform }}/xstreemly_libretro*.so ${{ matrix.strip }} \
+            ${{ matrix.platform }} "${VERSION#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.platform }}
+          path: build/package/*.zip
+
+  macos:
+    needs: linux-x86_64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: build/fixtures
+      - name: Mark the downloaded fixtures as built
+        run: touch build/fixtures/.stamp
+      - name: Install tools
+        run: brew install nasm pkg-config
+      - name: Dependency cache key
+        id: deps
+        run: echo "key=$(git submodule status | shasum | cut -c1-16)-${{ hashFiles('Makefile', 'Makefile.deps') }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            build/osx/ffmpeg
+            build/osx/mbedtls
+          key: deps-osx-${{ matrix.arch }}-${{ steps.deps.outputs.key }}
+      - name: Build
+        run: make -j3
+      - name: Test
+        run: make check
+      - name: Package
+        run: tests/ci/package.sh ./xstreemly_libretro.dylib "strip -x" macos-${{ matrix.arch }} "${VERSION#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-macos-${{ matrix.arch }}
+          path: build/package/*.zip
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: check-logs-macos-${{ matrix.arch }}
+          path: build/osx/check
+
+  # Tags only: GitHub release with every platform's zip and a complete
+  # source archive (GitHub's own source zips leave out the submodules, and
+  # the GPL wants the bundled libraries' source next to the binaries).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-x86_64, windows-x86_64, cross, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Source archive (with submodules)
+        run: |
+          v="${VERSION#v}"
+          git ls-files --recurse-submodules > files.txt
+          tar --transform "s,^,xstreemly-$v/," -czf "dist/xstreemly-$v-source.tar.gz" -T files.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --prerelease \
+            --title "X-Streemly ${GITHUB_REF_NAME}" --notes-file "docs/release-notes/${GITHUB_REF_NAME}.md"

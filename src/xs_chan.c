@@ -16,10 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
 
 #include "xs_chan.h"
+#include "xs_compat.h"
 
 static bool has_ext(const char *path, const char *ext)
 {
@@ -237,7 +237,7 @@ static void finish(xs_ctx_t *ctx, xs_chan_t *c, const char *key, const char *sav
    {
       char dir[4096];
       snprintf(dir, sizeof(dir), "%.4000s/X-Streemly", save_dir);
-      mkdir(dir, 0755);
+      xs_mkdir(dir);
       snprintf(c->state_path, sizeof(c->state_path), "%.4000s/%016llx.state", dir, lineup_hash(key));
       marks_load(&c->dead, dir, "dead.txt");
       marks_load(&c->favs, dir, "favourites.txt");

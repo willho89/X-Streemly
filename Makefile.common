@@ -19,7 +19,7 @@ SOURCES_C := \
 	$(CORE_DIR)/xs_fetch.c \
 	$(CORE_DIR)/xs_iptv.c \
 	$(CORE_DIR)/xs_hdhr.c \
-	$(CORE_DIR)/xs_glibc_compat.c \
+	$(CORE_DIR)/xs_compat.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
 	$(LIBRETRO_COMM_DIR)/formats/json/rjson.c \
 	$(LIBRETRO_COMM_DIR)/string/rstrtod.c

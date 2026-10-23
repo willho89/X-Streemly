@@ -49,6 +49,7 @@ typedef struct xs_ctx
    xs_options_t       opt;
    xs_tuner_t        *tuner;
    xs_run_stats_t     run;      /* emulation thread; reset by each stats line */
+   char               save_dir[4096];   /* frontend's save directory ("" = none); set at load */
 } xs_ctx_t;
 
 /* Thread-safe: may be called from any thread. */

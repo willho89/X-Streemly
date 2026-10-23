@@ -40,8 +40,18 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _WIN32
+/* Windows build (platform=win, run under Wine): LoadLibrary as dlopen. */
+#include <windows.h>
+#define RTLD_NOW   0
+#define RTLD_LOCAL 0
+static void *dlopen(const char *path, int flags) { (void)flags; return (void *)LoadLibraryA(path); }
+static void *dlsym(void *lib, const char *sym) { return (void *)(intptr_t)GetProcAddress((HMODULE)lib, sym); }
+static int dlclose(void *lib) { return FreeLibrary((HMODULE)lib) ? 0 : -1; }
+static const char *dlerror(void) { static char buf[64]; snprintf(buf, sizeof(buf), "LoadLibrary error %lu", GetLastError()); return buf; }
+#else
 #include <dlfcn.h>
-#include <sys/resource.h>
+#endif
 
 #include <libretro.h>
 
@@ -73,6 +83,14 @@ static double thread_cpu_s(void)
 {
    struct timespec ts;
    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+   return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* CPU time of the whole process (all the core's threads). */
+static double process_cpu_s(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
    return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
@@ -464,7 +482,7 @@ int main(int argc, char **argv)
    struct retro_game_info game = { 0 };
    bool realtime = !getenv("HARNESS_FAST");
    double *run_s, t0, t, tc, cpu, cpu_max = 0, sum = 0, wall = 0;
-   struct rusage ru0, ru1;
+   double pcpu0, pcpu1;
 
    void (*p_retro_set_environment)(retro_environment_t);
    void (*p_retro_set_video_refresh)(retro_video_refresh_t);
@@ -535,7 +553,7 @@ int main(int argc, char **argv)
    wav_open(getenv("HARNESS_WAV"));
    run_s = calloc(frames ? frames : 1, sizeof(*run_s));
    t0 = now_s();
-   getrusage(RUSAGE_SELF, &ru0);
+   pcpu0 = process_cpu_s();
    for (i = 0; i < frames; i++)
    {
       g_frame_no = i;
@@ -563,7 +581,7 @@ int main(int argc, char **argv)
          dump_frame(i);
    }
 
-   getrusage(RUSAGE_SELF, &ru1);
+   pcpu1 = process_cpu_s();
    wall = now_s() - t0;
    t = now_s();
    p_retro_unload_game();
@@ -581,8 +599,7 @@ int main(int argc, char **argv)
    }
    free(run_s);
    {
-      double cpu = (ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) / 1e6 +
-                   (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec) / 1e6;
+      double cpu = pcpu1 - pcpu0;
       printf("cpu: %.0f%% of one core over %.1f s (all threads)\n", wall > 0 ? 100 * cpu / wall : 0, wall);
    }
    printf("geometry changes %u, av_info changes %u\n", g_geom_changes, g_av_changes);

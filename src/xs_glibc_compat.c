@@ -36,3 +36,25 @@ int __isoc23_fscanf(FILE *f, const char *fmt, ...)
 }
 
 #endif
+
+/* Linux ARM (platform=linux-arm64 / linux-armhf, from DeeVee): glibc 2.38
+ * gave fmod a new symbol version on ARM, which alone would stop the core
+ * loading on glibc 2.36 (Raspberry Pi OS / Debian 12). Every fmod reference
+ * (-Wl,--wrap=fmod, FFmpeg included) goes to the original version. */
+#if defined(__linux__) && defined(__GLIBC__) && (defined(__aarch64__) || defined(__arm__))
+
+#if defined(__aarch64__)
+__asm__(".symver xs_fmod_base,fmod@GLIBC_2.17");
+#else
+__asm__(".symver xs_fmod_base,fmod@GLIBC_2.4");
+#endif
+
+double xs_fmod_base(double x, double y);
+double __wrap_fmod(double x, double y);
+
+double __wrap_fmod(double x, double y)
+{
+   return xs_fmod_base(x, y);
+}
+
+#endif

@@ -27,6 +27,7 @@
 #include <libretro.h>
 #include <rthreads/rthreads.h>
 
+#include "xs_compat.h"
 #include "xs_fetch.h"
 #include "xs_hdhr.h"
 #include "xs_iptv.h"
@@ -148,7 +149,7 @@ static void write_file(xs_ctx_t *ctx, const char *path, const char *data, size_t
       return;
    }
    fwrite(data, 1, len, f);
-   if (fclose(f) || rename(tmp, path))
+   if (fclose(f) || xs_replace_file(tmp, path))
       XS_WARN(ctx, "iptv-org: can't save %s\n", path);
 }
 
@@ -522,9 +523,9 @@ xs_iptv_t *xs_iptv_new(xs_ctx_t *ctx, const char *cache_dir)
    {
       char dir[4096];
       snprintf(dir, sizeof(dir), "%.4000s/X-Streemly", cache_dir);
-      mkdir(dir, 0755);
+      xs_mkdir(dir);
       snprintf(it->cache_dir, sizeof(it->cache_dir), "%.4000s/iptv-org", dir);
-      mkdir(it->cache_dir, 0755);
+      xs_mkdir(it->cache_dir);
    }
    it->lock = slock_new();
    it->cond = scond_new();

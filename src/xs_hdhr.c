@@ -19,18 +19,35 @@
  * AudioCodec. FFmpeg has no AC-4 decoder, so ATSC 3.0 channels with AC-4
  * audio are marked unplayable along with DRM ones.
  */
+#ifdef _WIN32
+#undef  _WIN32_WINNT
+#define _WIN32_WINNT 0x0600   /* WSAPoll, inet_ntop */
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 #include <errno.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <unistd.h>
 
+#ifdef _WIN32
+typedef SOCKET xs_sock_t;
+#define XS_BAD_SOCK      INVALID_SOCKET
+#define xs_sock_close    closesocket
+#define xs_poll          WSAPoll
+#else
+#include <poll.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+typedef int xs_sock_t;
+#define XS_BAD_SOCK      (-1)
+#define xs_sock_close    close
+#define xs_poll          poll
+#endif
 
 #include <formats/rjson.h>
 #include <libavutil/time.h>
@@ -127,22 +144,23 @@ static unsigned discover_udp(xs_ctx_t *ctx, xs_hdhr_dev_t *devs, unsigned max, x
 {
    struct sockaddr_in to;
    uint8_t req[32], rx[2048];
-   int fd, on = 1;
+   xs_sock_t fd;
+   int on = 1;
    unsigned n = 0, i;
    size_t len = build_request(req);
    int64_t until;
 
-   if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+   if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) == XS_BAD_SOCK)
       return 0;
-   setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+   setsockopt(fd, SOL_SOCKET, SO_BROADCAST, (const char *)&on, sizeof(on));
    memset(&to, 0, sizeof(to));
    to.sin_family      = AF_INET;
    to.sin_port        = htons(HDHR_PORT);
    to.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-   if (sendto(fd, req, len, 0, (struct sockaddr *)&to, sizeof(to)) < 0)
+   if (sendto(fd, (const char *)req, (int)len, 0, (struct sockaddr *)&to, sizeof(to)) < 0)
    {
       XS_DEBUG(ctx, "hdhomerun: discovery broadcast failed: %s\n", strerror(errno));
-      close(fd);
+      xs_sock_close(fd);
       return 0;
    }
    until = av_gettime_relative() + HDHR_WAIT_MS * 1000LL;
@@ -150,14 +168,14 @@ static unsigned discover_udp(xs_ctx_t *ctx, xs_hdhr_dev_t *devs, unsigned max, x
    {
       struct pollfd pfd = { fd, POLLIN, 0 };
       int64_t left = (until - av_gettime_relative()) / 1000;
-      ssize_t got;
+      int got;
       char base[256];
       bool dup = false;
       if (left <= 0 || (stop && stop(arg)))
          break;
-      if (poll(&pfd, 1, (int)(left < 100 ? left : 100)) <= 0)
+      if (xs_poll(&pfd, 1, (int)(left < 100 ? left : 100)) <= 0)
          continue;
-      got = recv(fd, rx, sizeof(rx), 0);
+      got = (int)recv(fd, (char *)rx, sizeof(rx), 0);
       if (got <= 0 || !parse_reply(rx, (size_t)got, base, sizeof(base)))
          continue;
       for (i = 0; i < n; i++)
@@ -169,7 +187,7 @@ static unsigned discover_udp(xs_ctx_t *ctx, xs_hdhr_dev_t *devs, unsigned max, x
          n++;
       }
    }
-   close(fd);
+   xs_sock_close(fd);
    return n;
 }
 
@@ -316,6 +334,10 @@ unsigned xs_hdhr_discover(xs_ctx_t *ctx, xs_hdhr_dev_t *devs, unsigned max, xs_a
    }
    else
    {
+#ifdef _WIN32
+      WSADATA wsa;
+      bool wsa_ok = !WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
       n = discover_udp(ctx, devs, max, stop, arg);
       if (!n)
       {
@@ -334,20 +356,31 @@ unsigned xs_hdhr_discover(xs_ctx_t *ctx, xs_hdhr_dev_t *devs, unsigned max, xs_a
             freeaddrinfo(res);
          }
       }
+#ifdef _WIN32
+      if (wsa_ok)
+         WSACleanup();
+#endif
    }
-   for (i = 0; i < n; i++)
+   for (i = 0; i < n; )
    {
       char url[320], err[128], *text;
       size_t len;
       snprintf(url, sizeof(url), "%s/discover.json", devs[i].base);
-      if ((text = get_json(ctx, url, &len, err, sizeof(err), stop, arg)))
+      if (!(text = get_json(ctx, url, &len, err, sizeof(err), stop, arg)))
       {
-         walk_objects(text, len, discover_member, &devs[i]);
-         free(text);
+         /* Not answering: don't try its lineup too (on Windows a refused
+          * connection takes seconds to report). */
+         XS_WARN(ctx, "hdhomerun: no answer from %s: %s\n", devs[i].base, err);
+         memmove(&devs[i], &devs[i + 1], (n - i - 1) * sizeof(devs[0]));
+         n--;
+         continue;
       }
+      walk_objects(text, len, discover_member, &devs[i]);
+      free(text);
       if (!devs[i].name[0])
          snprintf(devs[i].name, sizeof(devs[i].name), "HDHomeRun");
       XS_INFO(ctx, "hdhomerun: %s at %s, %u tuners\n", devs[i].name, devs[i].base, devs[i].tuners);
+      i++;
    }
    if (!n)
       XS_INFO(ctx, "hdhomerun: none found\n");
