@@ -19,9 +19,10 @@ NAME=""
 # more. Single ticks of a few ms happen when the OS runs something else on
 # a busy desktop (wall time without CPU time), so the worst tick gets room.
 # CI's shared macOS VMs stall a thread for ~100 ms now and then (a 98 ms
-# tick with 7 ms of CPU): the workflow raises the limit there with
-# CHECK_MAX_RUN_US, still far below a network wait (seconds).
-P99_RUN_US=5000
+# tick with 7 ms of CPU), and the Intel ones are slow enough to nudge p99
+# over 5 ms in a short run: the workflow raises both limits there
+# (CHECK_P99_RUN_US, CHECK_MAX_RUN_US), still far below a network wait.
+P99_RUN_US=${CHECK_P99_RUN_US:-5000}
 MAX_RUN_US=${CHECK_MAX_RUN_US:-50000}
 MAX_UNLOAD_MS=500
 # Zap to picture (M2: < 1 s). Wine's schannel (GnuTLS underneath) takes

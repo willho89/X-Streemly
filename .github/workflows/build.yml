@@ -189,6 +189,7 @@ jobs:
       - name: Test
         run: make check
         env:
+          CHECK_P99_RUN_US: 15000
           CHECK_MAX_RUN_US: 250000
       - name: Package
         run: tests/ci/package.sh ./xstreemly_libretro.dylib "strip -x" macos-${{ matrix.arch }} "${VERSION#v}"
